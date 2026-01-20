@@ -21,6 +21,11 @@ except Exception:
     LegacyRWHIModule = None
 
 
+def inverse_sigmoid(x, eps=1e-5):
+    x = x.clamp(min=eps, max=1 - eps)
+    return torch.log(x / (1 - x))
+
+
 class RWHI_Ultimate(BaseModule):
     """
     RWHI v5.2: Isotropic Safety Field + Physics-Enhanced Radar Gain + α-MLP Gating
@@ -324,6 +329,9 @@ class RWHI_Ultimate(BaseModule):
         theta_d = self._xy_to_theta_d(topk_xy)
 
         z = torch.full((B, self.num_query, 1), self.z_default, device=device, dtype=theta_d.dtype)
+        # [CRITICAL FIX] Convert normalized refs to logits for Transformer
+        theta_d = inverse_sigmoid(theta_d)
+        z = inverse_sigmoid(z)
         # FIX: 对应改进项 - Score Injection 保留梯度
         alpha_map = alpha_field.squeeze(1)
         alpha_flat = alpha_map.view(B, -1)

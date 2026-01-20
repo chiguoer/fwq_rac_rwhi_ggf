@@ -45,7 +45,7 @@ def test_v3_output_shape_and_finite():
     with torch.no_grad():
         anchors, _ = rwhi(radar_points, radar_mask=mask)
 
-    assert anchors.shape == (B, K, 3)
+    assert anchors.shape == (B, K, 10)
     assert torch.isfinite(anchors).all()
 
 
@@ -108,7 +108,7 @@ def test_numerical_stability_large_distance():
     with torch.no_grad():
         anchors, _ = rwhi(radar_points, radar_mask=mask)
 
-    assert anchors.shape == (B, K, 3)
+    assert anchors.shape == (B, K, 10)
     assert torch.isfinite(anchors).all()
 
 

@@ -44,8 +44,8 @@ def main():
         anchors_clean, _ = rwhi(radar_points_clean, radar_mask=mask)
         anchors_dirty, _ = rwhi(radar_points_dirty, radar_mask=mask)
 
-    assert anchors_clean.shape == (B, K, 3), f'anchors shape mismatch: {anchors_clean.shape}'
-    assert anchors_dirty.shape == (B, K, 3), f'anchors shape mismatch: {anchors_dirty.shape}'
+    assert anchors_clean.shape == (B, K, 10), f'anchors shape mismatch: {anchors_clean.shape}'
+    assert anchors_dirty.shape == (B, K, 10), f'anchors shape mismatch: {anchors_dirty.shape}'
     assert torch.isfinite(anchors_clean).all(), 'anchors_clean contains NaN/Inf'
     assert torch.isfinite(anchors_dirty).all(), 'anchors_dirty contains NaN/Inf'
 

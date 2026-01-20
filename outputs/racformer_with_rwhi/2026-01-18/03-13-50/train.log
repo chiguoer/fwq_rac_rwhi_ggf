@@ -1,7 +1,0 @@
-[2026-01-18 03:13:50,210][INFO] - Logs will be saved to outputs/racformer_with_rwhi/2026-01-18/03-13-50
-[2026-01-18 03:13:50,240][INFO] - Using GPU: Quadro RTX 8000
-[2026-01-18 03:13:50,240][INFO] - Initializing DDP with 2 GPUs...
-[2026-01-18 03:13:52,599][INFO] - Setting random seed: 0
-[2026-01-18 03:13:52,600][INFO] - Loading training set from data/nuscenes/
-[2026-01-18 03:14:14,410][INFO] - Loading validation set from data/nuscenes/
-[2026-01-18 03:14:19,748][INFO] - Creating model: RaCFormer

@@ -491,11 +491,11 @@ class RaCFormerHead(DETRHead):
                     f"max={z_vals.max().item():.4f}"
                 )
 
-        query_bbox = query_bbox.clone()
-        query_bbox[..., 0] = torch.clamp(query_bbox[..., 0], 0.0, 1.0)
-        query_bbox[..., 1] = torch.clamp(query_bbox[..., 1], 0.0, 1.0)
-        query_bbox[..., 2] = torch.clamp(query_bbox[..., 2], 0.0, 1.0)
-        return query_bbox
+        theta = torch.clamp(query_bbox[..., 0:1], 0.0, 1.0)
+        d = torch.clamp(query_bbox[..., 1:2], 0.0, 1.0)
+        z = torch.clamp(query_bbox[..., 2:3], 0.0, 1.0)
+        rest = query_bbox[..., 3:]
+        return torch.cat([theta, d, z, rest], dim=-1)
 
     def _prepare_query_feat(
         self,
@@ -711,9 +711,6 @@ class RaCFormerHead(DETRHead):
             device=device
         )
 
-        input_query_bbox = torch.cat([dn_query_bbox, init_query_bbox], dim=1)
-        input_query_feat = torch.cat([dn_query_feat, init_query_feat], dim=1)
-
         # 修复: 为map_known_indice设置默认值，避免未赋值引用
         map_known_indice = torch.tensor([], device=device, dtype=torch.long)
 
@@ -729,12 +726,15 @@ class RaCFormerHead(DETRHead):
             ]).long()
 
         if len(known_bid) > 0 and len(map_known_indice) > 0:
-            input_query_bbox[known_bid.long(), map_known_indice] = (
+            dn_query_bbox[known_bid.long(), map_known_indice] = (
                 known_bbox_expand
             )
-            input_query_feat[known_bid.long(), map_known_indice] = (
+            dn_query_feat[known_bid.long(), map_known_indice] = (
                 known_feat_expand
             )
+
+        input_query_bbox = torch.cat([dn_query_bbox, init_query_bbox], dim=1)
+        input_query_feat = torch.cat([dn_query_feat, init_query_feat], dim=1)
 
         total_size = dn_pad_size + self.num_query
         attn_mask = torch.ones([total_size, total_size], device=device) < 0

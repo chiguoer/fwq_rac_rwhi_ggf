@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ==============================================================================
-# RWHI v3 (Ultimate)
+# RWHI v5.2 (Ultimate)
 # - 各向同性安全场 (Uniform Safety Net)
 # - 物理增强雷达增益 (d/d_ref)^4
 # - 自适应 α-MLP 门控 (抑制远场噪声)
@@ -23,14 +23,14 @@ except Exception:
 
 class RWHI_Ultimate(BaseModule):
     """
-    RWHI v3: Isotropic Safety Field + Physics-Enhanced Radar Gain + α-MLP Gating
+    RWHI v5.2: Isotropic Safety Field + Physics-Enhanced Radar Gain + α-MLP Gating
 
     输入:
         - radar_points: [B, M, 5] (x, y, z, rcs, v_r)
         - radar_mask:  [B, M] padding 掩码 (1=有效, 0=padding)
 
     输出:
-        - anchors: [B, K, 3] (theta, d, z_norm)
+        - anchors: [B, K, 10] (theta, d, z_norm, ..., vx)
     """
 
     def __init__(
@@ -89,9 +89,11 @@ class RWHI_Ultimate(BaseModule):
 
         # α-MLP (point-wise, 无循环)
         self.alpha_fc1 = nn.Linear(5, 64)
-        self.alpha_bn1 = nn.BatchNorm1d(64)
+        # FIX: 对应改进项 - LayerNorm 替代 BatchNorm
+        self.alpha_ln1 = nn.LayerNorm(64)
         self.alpha_fc2 = nn.Linear(64, 64)
-        self.alpha_bn2 = nn.BatchNorm1d(64)
+        # FIX: 对应改进项 - LayerNorm 替代 BatchNorm
+        self.alpha_ln2 = nn.LayerNorm(64)
         self.alpha_fc3 = nn.Linear(64, 1)
         # 冷启动降低雷达置信度，避免未训练噪声污染
         nn.init.constant_(self.alpha_fc3.bias, -4.59)
@@ -120,6 +122,12 @@ class RWHI_Ultimate(BaseModule):
         grid_xy = torch.stack([xx, yy], dim=-1).reshape(-1, 2)  # [H*W, 2]
 
         self.register_buffer('grid_xy', grid_xy)
+        # FIX: 对应改进项 - Deterministic Spatial Jitter 固定纹理噪声
+        x_coords_norm = (x_coords - x_min) / (x_max - x_min)
+        y_coords_norm = (y_coords - y_min) / (y_max - y_min)
+        yy_norm, xx_norm = torch.meshgrid(y_coords_norm, x_coords_norm, indexing='ij')
+        fixed_noise = (torch.sin(100.0 * xx_norm) + torch.cos(100.0 * yy_norm)) * 1e-3
+        self.register_buffer('fixed_noise', fixed_noise)
         self.cell_size_x = cell_size_x
         self.cell_size_y = cell_size_y
 
@@ -142,11 +150,9 @@ class RWHI_Ultimate(BaseModule):
     def _xy_to_theta_d(self, xy):
         x = xy[..., 0]
         y = xy[..., 1]
-        eps = 1e-6
-        atan = torch.atan(y / (x + eps))
-        theta = torch.where(x < 0, atan + math.pi, atan)
-        theta = torch.where((x >= 0) & (y < 0), theta + 2 * math.pi, theta)
-        theta = theta / (2 * math.pi)
+        # FIX: 对应改进项 - 使用 atan2 并归一化到 [0, 1]
+        theta = torch.atan2(y, x)
+        theta = (theta + math.pi) / (2 * math.pi)
         dist = torch.sqrt(x ** 2 + y ** 2).clamp(min=1e-6)
         d = torch.clamp(dist / self.polar_radius, 0.0, 1.0)
         theta = torch.clamp(theta, 0.0, 1.0)
@@ -170,11 +176,11 @@ class RWHI_Ultimate(BaseModule):
         x = feat.reshape(B * M, 5)
 
         x = self.alpha_fc1(x)
-        x = self.alpha_bn1(x)
+        x = self.alpha_ln1(x)
         x = F.relu(x, inplace=True)
 
         x = self.alpha_fc2(x)
-        x = self.alpha_bn2(x)
+        x = self.alpha_ln2(x)
         x = F.relu(x, inplace=True)
 
         x = self.alpha_fc3(x)
@@ -256,7 +262,8 @@ class RWHI_Ultimate(BaseModule):
 
         # 物理增益 (含 d^4)
         w_phys = self._compute_phys_gain(radar_points)
-        i_radar = (alpha.squeeze(-1) * w_phys) * radar_mask
+        alpha_weight = alpha.squeeze(-1) * radar_mask
+        i_radar = alpha_weight * w_phys
 
         # ScatterAdd 注入 BEV 网格 (无循环)
         x = radar_points[..., self.radar_channel_map['x']]
@@ -271,6 +278,7 @@ class RWHI_Ultimate(BaseModule):
         batch_offset = (torch.arange(B, device=device).view(B, 1) * (self.grid_size_h * self.grid_size_w))
         flat_idx = (flat_idx + batch_offset).view(-1)
         flat_weight = i_radar.view(-1)
+        flat_alpha = alpha_weight.view(-1)
 
         radar_field_flat = torch.zeros(
             B * self.grid_size_h * self.grid_size_w,
@@ -279,17 +287,30 @@ class RWHI_Ultimate(BaseModule):
         )
         radar_field_flat.scatter_add_(0, flat_idx, flat_weight)
         radar_field = radar_field_flat.view(B, 1, self.grid_size_h, self.grid_size_w)
+        alpha_field_flat = torch.zeros(
+            B * self.grid_size_h * self.grid_size_w,
+            device=device,
+            dtype=radar_points.dtype,
+        )
+        alpha_field_flat.scatter_add_(0, flat_idx, flat_alpha)
+        alpha_field = alpha_field_flat.view(B, 1, self.grid_size_h, self.grid_size_w)
 
         # 空间扩散 (MaxPool2d) - 模拟雷达位置不确定性
         radar_field = self.diffusion(radar_field)
+        alpha_field = self.diffusion(alpha_field)
 
         # 各向同性安全场 (Uniform Safety Net)
         base_field = radar_field.new_full(
             (B, 1, self.grid_size_h, self.grid_size_w),
             self.base_bias,
         )
-        # 加入微小随机噪声打破 Top-K 同值平局，避免索引偏向左上角
-        base_field = base_field + torch.rand_like(base_field) * 1e-2
+        fixed_noise = self.fixed_noise.to(dtype=base_field.dtype, device=base_field.device)
+        fixed_noise = fixed_noise.unsqueeze(0).unsqueeze(0)
+        # FIX: 对应改进项 - 训练态加入随机噪声，评估态严格确定性
+        if self.training:
+            base_field = base_field + fixed_noise + (torch.rand_like(base_field) * 1e-3)
+        else:
+            base_field = base_field + fixed_noise
 
         # 加性融合
         fused = base_field + radar_field
@@ -303,7 +324,28 @@ class RWHI_Ultimate(BaseModule):
         theta_d = self._xy_to_theta_d(topk_xy)
 
         z = torch.full((B, self.num_query, 1), self.z_default, device=device, dtype=theta_d.dtype)
-        anchors = torch.cat([theta_d, z], dim=-1)
+        # FIX: 对应改进项 - Score Injection 保留梯度
+        alpha_map = alpha_field.squeeze(1)
+        alpha_flat = alpha_map.view(B, -1)
+        alpha_topk = torch.gather(alpha_flat, 1, topk_idx)
+        alpha_topk = torch.clamp(alpha_topk, 0.0, 1.0)
+        alpha_topk = alpha_topk.unsqueeze(-1)
+
+        zero_col = torch.zeros((B, self.num_query, 1), device=device, dtype=theta_d.dtype)
+        anchors = torch.cat(
+            [
+                theta_d,
+                z,
+                zero_col,
+                zero_col,
+                zero_col + 0.2,
+                zero_col,
+                zero_col + 1.0,
+                alpha_topk,
+                zero_col,
+            ],
+            dim=-1,
+        )
 
         return anchors, None
 

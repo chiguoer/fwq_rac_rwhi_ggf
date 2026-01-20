@@ -80,7 +80,16 @@ def encode_bbox(bboxes, pc_range=None):
 def decode_bbox(bboxes, pc_range=None):
     xyz = bboxes[..., 0:3].clone()
     wlh = bboxes[..., 3:6].exp()
-    rot = torch.atan2(bboxes[..., 6:7], bboxes[..., 7:8])
+    rot_sin = bboxes[..., 6:7]
+    rot_cos = bboxes[..., 7:8]
+    # Avoid NaN gradients when both sin/cos are near zero.
+    eps = 1e-6
+    rot_cos = torch.where(
+        (rot_sin.abs() < eps) & (rot_cos.abs() < eps),
+        rot_cos + eps,
+        rot_cos,
+    )
+    rot = torch.atan2(rot_sin, rot_cos)
 
     if pc_range is not None:
         xyz[..., 0] = xyz[..., 0] * (pc_range[3] - pc_range[0]) + pc_range[0]

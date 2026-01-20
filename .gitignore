@@ -1,5 +1,6 @@
 # --- Windows 系统文件 ---
 output/
+outputs/
 __pycache__/
 
 *.tmp

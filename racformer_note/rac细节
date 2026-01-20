@@ -1,0 +1,13 @@
+拖车/施工车​​：近距离（0.5m）检测能力极弱（AP<0.01），需优化小目标检测算法。
+​​锥桶/隔离墩​​：远距离（4.0m）AP超0.8，稳定性最佳。
+
+
+平均平移误差(average translation error，ATE) 是二维欧几里德中心距离(单位为米)；
+
+平均尺度误差(average scale error，ASE) 是1 - IoU, 其中IoU 是角度对齐后的三维交并；
+
+平均角度误差(average orientation error，AOE) 是预测值和真实值之间最小的偏航角差；
+
+平均速度误差(average velocity error，AVE) 是二维速度差的L2 范数(m/s)；
+
+平均属性错误(average attribute error，AAE) 被定义为1−acc, 其中acc 为类别分类准确度；

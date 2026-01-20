@@ -93,6 +93,8 @@ class RWHI_Ultimate(BaseModule):
         self.alpha_fc2 = nn.Linear(64, 64)
         self.alpha_bn2 = nn.BatchNorm1d(64)
         self.alpha_fc3 = nn.Linear(64, 1)
+        # 冷启动降低雷达置信度，避免未训练噪声污染
+        nn.init.constant_(self.alpha_fc3.bias, -4.59)
 
         # 空间扩散 (MaxPool2d, TRT 友好)
         self.diffusion = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
@@ -198,7 +200,7 @@ class RWHI_Ultimate(BaseModule):
 
         # 距离补偿: 抵消雷达方程 1/R^4 衰减 (关键物理项)
         dist = torch.sqrt(x ** 2 + y ** 2).clamp(min=1e-6)
-        dist_term = (dist / self.d_ref) ** 4
+        dist_term = (dist / self.d_ref).pow(4).clamp(max=20.0)
 
         return rcs_term * doppler_term * dist_term
 
@@ -286,6 +288,8 @@ class RWHI_Ultimate(BaseModule):
             (B, 1, self.grid_size_h, self.grid_size_w),
             self.base_bias,
         )
+        # 加入微小随机噪声打破 Top-K 同值平局，避免索引偏向左上角
+        base_field = base_field + torch.rand_like(base_field) * 1e-2
 
         # 加性融合
         fused = base_field + radar_field

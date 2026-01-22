@@ -30,7 +30,8 @@ class RaCFormerTransformer(BaseModule):
                  pc_range=[], 
                  num_ray=150, 
                  d_region_list = [0.15, 0.1, 0.1, 0.08, 0.08, 0.05], 
-                 spatial_shapes=(128, 128), 
+                 spatial_shapes=(128, 128),
+                 polar_radius=None,  # [FIX v7.1] 支持传入固定 polar_radius (推荐 65.0)
                  init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
@@ -38,7 +39,9 @@ class RaCFormerTransformer(BaseModule):
 
         self.embed_dims = embed_dims
         self.pc_range = pc_range
-        self.map_size, self.polar_radius = compute_map_size_and_radius(self.pc_range)
+        # [FIX v7.1] 支持固定 polar_radius，与 RWHI v5.3 保持一致
+        self.map_size, _default_radius = compute_map_size_and_radius(self.pc_range)
+        self.polar_radius = polar_radius if polar_radius is not None else _default_radius
 
         self.decoder = RaCFormerTransformerDecoder(
             embed_dims,

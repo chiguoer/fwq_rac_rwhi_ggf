@@ -15,7 +15,17 @@
 #   - w_d = min((d/d_ref)^λ, w_d_max): 距离权重
 #
 # 完全兼容 RaCFormer bbox 结构 (见 racformer_query_generation_points.md)
+#
+# [FIX v7.1] 关键修正:
+# 1. polar_radius 固定为 R_MAX = 65.0m (不再从 pc_range 计算)
+# 2. 输出 θ/d/z 为归一化值 [0,1]，不做 inverse_sigmoid
+#    (Transformer 的 refine_bbox 会对输入做 inverse_sigmoid)
+# 3. d/z 使用 clamp(eps, 1-eps) 防止 inverse_sigmoid 溢出
 # ==============================================================================
+
+# 固定常量
+R_MAX = 65.0  # 极坐标最大半径 (米) - 文档要求固定值
+EPS = 1e-5    # 数值稳定性常量
 
 import math
 import torch
@@ -253,8 +263,10 @@ class RWHI_v53(BaseModule):
         self.grid_size_h = int(grid_size_h)
         self.grid_size_w = int(grid_size_w)
         
-        # 计算 map_size 和 polar_radius (R_MAX = 65m)
-        self.map_size, self.polar_radius = compute_map_size_and_radius(self.pc_range)
+        # [FIX v7.1] 固定 polar_radius = R_MAX = 65.0m
+        # 不再从 pc_range 计算 (避免 sqrt(51.2² + 51.2²) ≈ 72.4m 的问题)
+        self.map_size, _ = compute_map_size_and_radius(self.pc_range)
+        self.polar_radius = R_MAX  # 固定 65.0m
         
         # 雷达通道映射
         self.radar_channel_map = radar_channel_map or {
@@ -334,7 +346,9 @@ class RWHI_v53(BaseModule):
     def _build_init_anchors(self):
         """
         构建初始均匀安全锚点 (用于 init_query_bbox 初始化)
-        输出为 Logits 形式
+        
+        [FIX v7.1] 输出为归一化值 [0, 1]，不做 inverse_sigmoid
+        因为 Transformer 的 refine_bbox 会对 d/z 做 inverse_sigmoid
         """
         device = self.grid_xy.device
         total_cells = self.grid_size_h * self.grid_size_w
@@ -343,21 +357,15 @@ class RWHI_v53(BaseModule):
         base_idx = (torch.arange(self.num_query, dtype=torch.long, device=device) * total_cells) // self.num_query
         xy = self.grid_xy[base_idx]
         
-        # 转换为极坐标
+        # 转换为极坐标 - 已在 _xy_to_theta_d 中 clamp 到 (EPS, 1-EPS)
         theta_d = self._xy_to_theta_d(xy)  # [num_query, 2], 归一化到 [0, 1]
+        
+        # z_norm: clamp 到 (EPS, 1-EPS) 防止 refine_bbox 中 inverse_sigmoid 溢出
         z = torch.full((self.num_query, 1), self.z_default, device=device, dtype=theta_d.dtype)
+        z = z.clamp(min=EPS, max=1.0 - EPS)
         
-        # 转换为 Logits
-        theta_d = self._inverse_sigmoid(theta_d)
-        z = self._inverse_sigmoid(z)
-        
+        # [FIX v7.1] 不再做 inverse_sigmoid，直接返回归一化值
         return torch.cat([theta_d, z], dim=-1)
-    
-    @staticmethod
-    def _inverse_sigmoid(x, eps=1e-5):
-        """逆 Sigmoid 函数"""
-        x = x.clamp(min=eps, max=1.0 - eps)
-        return torch.log(x / (1.0 - x))
     
     def _xy_to_theta_d(self, xy):
         """
@@ -365,6 +373,8 @@ class RWHI_v53(BaseModule):
         
         - theta_rad = atan2(y, x) → [0, 2π) → theta_norm = theta_rad / (2π) ∈ [0, 1)
         - d = sqrt(x² + y²) → d_norm = d / R_MAX ∈ (EPS, 1-EPS)
+        
+        [FIX v7.1] 使用固定 R_MAX = 65.0m, 并 clamp d 到 (EPS, 1-EPS)
         """
         x = xy[..., 0]
         y = xy[..., 1]
@@ -374,11 +384,14 @@ class RWHI_v53(BaseModule):
         theta_rad = (theta_rad + 2 * math.pi) % (2 * math.pi)  # [0, 2π)
         theta_norm = theta_rad / (2 * math.pi)  # [0, 1)
         
-        # 计算距离
+        # 计算距离 - 使用固定 R_MAX = 65.0m
         dist = torch.sqrt(x ** 2 + y ** 2).clamp(min=1e-6)
-        d_norm = (dist / self.polar_radius).clamp(min=1e-5, max=1.0 - 1e-5)
+        # [FIX v7.1] clamp 到 (EPS, 1-EPS) 防止 refine_bbox 中 inverse_sigmoid 溢出
+        d_norm = (dist / self.polar_radius).clamp(min=EPS, max=1.0 - EPS)
         
-        theta_norm = theta_norm.clamp(min=0.0, max=1.0 - 1e-5)
+        # theta 可以是 [0, 1)，不需要严格 clamp 到 (EPS, 1-EPS)
+        # 因为 refine_bbox 对 theta 使用直接加法，不做 inverse_sigmoid
+        theta_norm = theta_norm.clamp(min=0.0, max=1.0 - EPS)
         
         return torch.stack([theta_norm, d_norm], dim=-1)
     
@@ -574,20 +587,20 @@ class RWHI_v53(BaseModule):
         # 从预计算网格解码坐标
         topk_xy = self.grid_xy[topk_idx]  # [B, K, 2]
         
-        # 转换为极坐标
+        # 转换为极坐标 - 已在 _xy_to_theta_d 中 clamp 到 (EPS, 1-EPS)
         theta_d = self._xy_to_theta_d(topk_xy)  # [B, K, 2]
         
-        # z_norm 初始化
+        # z_norm 初始化 - clamp 到 (EPS, 1-EPS) 防止 refine_bbox 中 inverse_sigmoid 溢出
         z = torch.full(
             (batch_size, self.num_query, 1),
             self.z_default,
             device=device,
             dtype=theta_d.dtype
         )
+        z = z.clamp(min=EPS, max=1.0 - EPS)
         
-        # 转换为 Logits
-        theta_d = self._inverse_sigmoid(theta_d)
-        z = self._inverse_sigmoid(z)
+        # [FIX v7.1] 不再做 inverse_sigmoid，直接输出归一化值
+        # Transformer 的 refine_bbox 会对 d/z 做 inverse_sigmoid
         
         # w, l, h 使用 log 形式
         w_log = math.log(max(self.w_default, 0.1))

@@ -66,6 +66,7 @@ class RaCFormerHead(DETRHead):
         test_cfg=None,
         use_rwhi=False,
         rwhi_cfg=None,
+        polar_radius=None,  # [FIX v7.1] 支持传入固定 polar_radius (推荐 65.0)
         **kwargs
     ):
         """
@@ -84,6 +85,7 @@ class RaCFormerHead(DETRHead):
             test_cfg: 测试配置 (默认None, 内部初始化为{max_per_img:100})
             use_rwhi: 是否启用RWHI Query初始化
             rwhi_cfg: RWHI模块配置
+            polar_radius: [FIX v7.1] 固定极坐标半径 (推荐 65.0)，若 None 则从 pc_range 计算
             **kwargs: 其他参数
         """
         # 修复: 可变默认参数改为None，函数内初始化，避免实例共享
@@ -107,6 +109,9 @@ class RaCFormerHead(DETRHead):
         # RWHI配置
         self.use_rwhi = use_rwhi
         self.rwhi_cfg = rwhi_cfg
+        
+        # [FIX v7.1] 保存传入的 polar_radius，用于全链路统一
+        self._config_polar_radius = polar_radius
 
         # 从kwargs中提取pc_range（如果存在）
         self.pc_range = kwargs.pop(
@@ -131,7 +136,10 @@ class RaCFormerHead(DETRHead):
         # 验证bbox_coder中的pc_range
         if hasattr(self.bbox_coder, 'pc_range'):
             self.pc_range = self.bbox_coder.pc_range
-        self.map_size, self.polar_radius = compute_map_size_and_radius(self.pc_range)
+        
+        # [FIX v7.1] 支持固定 polar_radius，与 RWHI v5.3 保持一致
+        self.map_size, _default_radius = compute_map_size_and_radius(self.pc_range)
+        self.polar_radius = self._config_polar_radius if self._config_polar_radius is not None else _default_radius
 
         self.dn_enabled = query_denoising
         self.dn_group_num = query_denoising_groups
@@ -525,7 +533,17 @@ class RaCFormerHead(DETRHead):
         return expanded
 
     def _validate_query_bbox(self, query_bbox):
-        """验证并clamp query坐标范围"""
+        """
+        验证并clamp query坐标范围
+        
+        [FIX v7.1] 关键修正:
+        - d 和 z 需要 clamp 到 (EPS, 1-EPS)，不能是 0 或 1
+        - 因为 Transformer 的 refine_bbox 会对 d/z 做 inverse_sigmoid
+        - inverse_sigmoid(0) = -inf, inverse_sigmoid(1) = +inf
+        - theta 可以是 [0, 1)，因为 refine_bbox 对 theta 使用直接加法
+        """
+        EPS = 1e-5
+        
         if self.training:
             theta_vals = query_bbox[..., 0]
             d_vals = query_bbox[..., 1]
@@ -537,22 +555,25 @@ class RaCFormerHead(DETRHead):
                     f"min={theta_vals.min().item():.4f}, "
                     f"max={theta_vals.max().item():.4f}"
                 )
-            if d_vals.min() < 0 or d_vals.max() > 1:
+            # [FIX v7.1] d/z 需要在 (EPS, 1-EPS) 范围内
+            if d_vals.min() < EPS or d_vals.max() > 1 - EPS:
                 print(
-                    f"[WARNING RWHI] d out of [0,1]: "
+                    f"[WARNING RWHI] d out of (EPS,1-EPS): "
                     f"min={d_vals.min().item():.4f}, "
                     f"max={d_vals.max().item():.4f}"
                 )
-            if z_vals.min() < 0 or z_vals.max() > 1:
+            if z_vals.min() < EPS or z_vals.max() > 1 - EPS:
                 print(
-                    f"[WARNING RWHI] z out of [0,1]: "
+                    f"[WARNING RWHI] z out of (EPS,1-EPS): "
                     f"min={z_vals.min().item():.4f}, "
                     f"max={z_vals.max().item():.4f}"
                 )
 
-        theta = torch.clamp(query_bbox[..., 0:1], 0.0, 1.0)
-        d = torch.clamp(query_bbox[..., 1:2], 0.0, 1.0)
-        z = torch.clamp(query_bbox[..., 2:3], 0.0, 1.0)
+        # theta 可以是 [0, 1)
+        theta = torch.clamp(query_bbox[..., 0:1], 0.0, 1.0 - EPS)
+        # [FIX v7.1] d/z 必须 clamp 到 (EPS, 1-EPS) 防止 inverse_sigmoid 溢出
+        d = torch.clamp(query_bbox[..., 1:2], EPS, 1.0 - EPS)
+        z = torch.clamp(query_bbox[..., 2:3], EPS, 1.0 - EPS)
         rest = query_bbox[..., 3:]
         return torch.cat([theta, d, z, rest], dim=-1)
 
@@ -859,13 +880,17 @@ class RaCFormerHead(DETRHead):
         return input_query_bbox, input_query_feat, attn_mask, mask_dict
 
     def _add_bbox_noise(self, known_bbox_expand, wlh):
-        """添加边界框噪声"""
-        polar_radius = 65.0
+        """
+        添加边界框噪声
+        
+        [FIX v7.1] 使用 self.polar_radius (从 config 传入或从 pc_range 计算)
+        确保与 RWHI v5.3 和 Transformer 使用相同的 polar_radius
+        """
         rand_prob = torch.rand_like(known_bbox_expand) * 2 - 1.0
 
         arc_len_ratio = (
             torch.sqrt(wlh[..., 0:1]**2 + wlh[..., 1:2]**2)
-            / (2 * torch.pi * known_bbox_expand[..., 1:2] * polar_radius)
+            / (2 * torch.pi * known_bbox_expand[..., 1:2] * self.polar_radius)
         )
         theta_delta = (
             torch.mul(rand_prob[..., 0:1], arc_len_ratio / 2)
@@ -877,7 +902,7 @@ class RaCFormerHead(DETRHead):
             torch.mul(
                 rand_prob[..., 1:2],
                 torch.sqrt(wlh[..., 0:1]**2 + wlh[..., 1:2]**2)
-                / (polar_radius * 2)
+                / (self.polar_radius * 2)
             )
             * self.dn_bbox_noise_scale
         )

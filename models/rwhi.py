@@ -6,9 +6,19 @@
 # - v5.3: 改进版 (推荐) - 使用 α * log(1 + σ * w_d) + Feature-Guided Init
 # - v5.2/v3: 各向同性安全场 + (d/d_ref)^4
 # - legacy/v2/v2.1: 旧版实现
+#
+# [FIX v7.1] 关键修正:
+# 1. polar_radius 固定为 R_MAX = 65.0m (不再从 pc_range 计算)
+# 2. 输出 θ/d/z 为归一化值 [0,1]，不做 inverse_sigmoid
+#    (Transformer 的 refine_bbox 会对输入做 inverse_sigmoid)
+# 3. d/z 使用 clamp(eps, 1-eps) 防止 inverse_sigmoid 溢出
 # ==============================================================================
 
 import math
+
+# 固定常量
+R_MAX = 65.0  # 极坐标最大半径 (米) - 文档要求固定值
+EPS = 1e-5    # 数值稳定性常量
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -84,7 +94,10 @@ class RWHI_Ultimate(BaseModule):
         self.grid_size_h = int(grid_size_h)
         self.grid_size_w = int(grid_size_w)
 
-        self.map_size, self.polar_radius = compute_map_size_and_radius(self.pc_range)
+        # [FIX v7.1] 固定 polar_radius = R_MAX = 65.0m
+        # 不再从 pc_range 计算 (避免 sqrt(51.2² + 51.2²) ≈ 72.4m 的问题)
+        self.map_size, _ = compute_map_size_and_radius(self.pc_range)
+        self.polar_radius = R_MAX  # 固定 65.0m
 
         # 雷达通道映射
         self.radar_channel_map = radar_channel_map or {
@@ -142,20 +155,22 @@ class RWHI_Ultimate(BaseModule):
     def _build_init_anchors(self):
         """
         初始化使用的均匀安全锚点 (用于 init_query_bbox)，不参与前向逻辑。
-        输出为 Logits 形式，与 forward 保持一致。
+        
+        [FIX v7.1] 输出为归一化值 [0, 1]，不做 inverse_sigmoid
+        因为 Transformer 的 refine_bbox 会对 d/z 做 inverse_sigmoid
         """
         device = self.grid_xy.device
         total_cells = self.grid_size_h * self.grid_size_w
         # 均匀步进采样索引，确保初始化覆盖全域
         base_idx = (torch.arange(self.num_query, dtype=torch.long, device=device) * total_cells) // self.num_query
         xy = self.grid_xy[base_idx]
-        theta_d = self._xy_to_theta_d(xy)  # [0, 1] 范围
+        theta_d = self._xy_to_theta_d(xy)  # [0, 1] 范围，d 已 clamp 到 (EPS, 1-EPS)
+        
+        # z_norm: clamp 到 (EPS, 1-EPS) 防止 refine_bbox 中 inverse_sigmoid 溢出
         z = torch.full((self.num_query, 1), self.z_default, device=device, dtype=theta_d.dtype)
+        z = z.clamp(min=EPS, max=1.0 - EPS)
 
-        # [FIX] 坐标域修正: 转换为 Logits (与 forward 保持一致)
-        theta_d = self.inverse_sigmoid(theta_d)
-        z = self.inverse_sigmoid(z)
-
+        # [FIX v7.1] 不再做 inverse_sigmoid，直接返回归一化值
         return torch.cat([theta_d, z], dim=-1)
 
     # ============================================================
@@ -175,14 +190,19 @@ class RWHI_Ultimate(BaseModule):
     # 坐标转换 (xy -> theta/d)
     # ============================================================
     def _xy_to_theta_d(self, xy):
+        """
+        [FIX v7.1] 使用固定 R_MAX = 65.0m, 并 clamp d 到 (EPS, 1-EPS)
+        """
         x = xy[..., 0]
         y = xy[..., 1]
-        # FIX: 对应改进项 - 使用 atan2 并归一化到 [0, 1]
+        # 使用 atan2 并归一化到 [0, 1]
         theta = torch.atan2(y, x)
         theta = (theta + math.pi) / (2 * math.pi)
         dist = torch.sqrt(x ** 2 + y ** 2).clamp(min=1e-6)
-        d = torch.clamp(dist / self.polar_radius, 0.0, 1.0)
-        theta = torch.clamp(theta, 0.0, 1.0)
+        # [FIX v7.1] clamp 到 (EPS, 1-EPS) 防止 refine_bbox 中 inverse_sigmoid 溢出
+        d = (dist / self.polar_radius).clamp(min=EPS, max=1.0 - EPS)
+        # theta 可以是 [0, 1)，不需要严格 clamp 到 (EPS, 1-EPS)
+        theta = theta.clamp(min=0.0, max=1.0 - EPS)
         return torch.stack([theta, d], dim=-1)
 
     # ============================================================
@@ -348,14 +368,14 @@ class RWHI_Ultimate(BaseModule):
 
         # 从预计算网格解码坐标
         topk_xy = self.grid_xy[topk_idx]
-        theta_d = self._xy_to_theta_d(topk_xy)  # 当前在 [0, 1] 范围
+        theta_d = self._xy_to_theta_d(topk_xy)  # 归一化值 [0, 1], d 已 clamp 到 (EPS, 1-EPS)
 
+        # z_norm: clamp 到 (EPS, 1-EPS) 防止 refine_bbox 中 inverse_sigmoid 溢出
         z = torch.full((B, self.num_query, 1), self.z_default, device=device, dtype=theta_d.dtype)
+        z = z.clamp(min=EPS, max=1.0 - EPS)
 
-        # [FIX] 坐标域修正: 转换为 Logits 因为 Transformer 内部会应用 sigmoid
-        # sigmoid(inverse_sigmoid(x)) ≈ x，确保参考点覆盖完整空间
-        theta_d = self.inverse_sigmoid(theta_d)
-        z = self.inverse_sigmoid(z)
+        # [FIX v7.1] 不再做 inverse_sigmoid，直接输出归一化值
+        # Transformer 的 refine_bbox 会对 d/z 做 inverse_sigmoid
 
         # FIX: 对应改进项 - Score Injection 保留梯度
         alpha_map = alpha_field.squeeze(1)

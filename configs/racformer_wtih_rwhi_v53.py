@@ -101,6 +101,12 @@ rwhi_cfg = dict(
 )
 
 # ============================================================
+# 全链路 polar_radius 统一配置
+# [FIX v7.1] RWHI v5.3 要求全链路使用 R_MAX = 65.0m
+# ============================================================
+R_MAX = 65.0  # 极坐标最大半径 (米) - 文档要求固定值
+
+# ============================================================
 # 模型配置 - 启用 RWHI v5.3
 # ============================================================
 model = dict(
@@ -111,6 +117,26 @@ model = dict(
         # 启用 RWHI Query初始化
         use_rwhi=True,
         rwhi_cfg=rwhi_cfg,
+        
+        # [FIX v7.1] 全链路统一 polar_radius
+        polar_radius=R_MAX,
+        
+        # Transformer 配置 - 覆盖基础配置以传入 polar_radius
+        transformer=dict(
+            type='RaCFormerTransformer',
+            polar_radius=R_MAX,  # [FIX v7.1] 传入固定值
+        ),
+    ),
+)
+
+# ============================================================
+# 训练配置 - ThetaL1Cost 使用固定 polar_radius
+# ============================================================
+train_cfg = dict(
+    pts=dict(
+        assigner=dict(
+            theta_cost=dict(polar_radius=R_MAX),
+        ),
     ),
 )
 
@@ -161,4 +187,3 @@ find_unused_parameters = True
 #
 # 结论: 远场车得分略高，但差距可控，符合设计目标
 # ============================================================
-

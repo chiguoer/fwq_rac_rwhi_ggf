@@ -22,7 +22,7 @@ pushd "${REPO_ROOT}" >/dev/null
 python -c "import torch; import onnx; print(torch.__version__)"
 python tools/smoke_test_rwhi.py
 pytest -q tests/test_rwhi_v3.py -s
-python tools/export_onnx_rwhi.py
+#python tools/export_onnx_rwhi.py
 
 popd >/dev/null
 

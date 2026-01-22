@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 # ==============================================================================
-# RWHI v5.2 (Ultimate)
-# - 各向同性安全场 (Uniform Safety Net)
-# - 物理增强雷达增益 (d/d_ref)^4
-# - 自适应 α-MLP 门控 (抑制远场噪声)
-# - ScatterAdd + MaxPool + Global Top-K (TRT 静态图友好)
+# RWHI (Radar-Weighted Hybrid Initialization) - 统一入口
+# ==============================================================================
+# 支持版本:
+# - v5.3: 改进版 (推荐) - 使用 α * log(1 + σ * w_d) + Feature-Guided Init
+# - v5.2/v3: 各向同性安全场 + (d/d_ref)^4
+# - legacy/v2/v2.1: 旧版实现
 # ==============================================================================
 
 import math
@@ -19,6 +20,13 @@ try:
     from .rwhi_legacy import RWHIModule as LegacyRWHIModule
 except Exception:
     LegacyRWHIModule = None
+
+try:
+    from .rwhi_v53 import RWHI_v53, AlphaMLP, AlphaEncoder
+except Exception:
+    RWHI_v53 = None
+    AlphaMLP = None
+    AlphaEncoder = None
 
 
 class RWHI_Ultimate(BaseModule):
@@ -397,7 +405,12 @@ class RWHI_Ultimate(BaseModule):
 
 class RWHIModule(BaseModule):
     """
-    对外统一入口: 默认启用 v3, 可通过 rwhi_version='legacy' 回滚
+    对外统一入口
+    
+    支持版本:
+    - 'v5.3': 改进版 (推荐) - 使用 α * log(1 + σ * w_d) + Feature-Guided Init
+    - 'v3' / 'v5.2': 各向同性安全场 + (d/d_ref)^4
+    - 'legacy' / 'v2' / 'v2.1': 旧版实现
     """
 
     def __init__(self, rwhi_version='v3', init_cfg=None, **kwargs):
@@ -409,14 +422,37 @@ class RWHIModule(BaseModule):
                 raise RuntimeError('Legacy RWHI module not found.')
             self.impl = LegacyRWHIModule(init_cfg=init_cfg, **kwargs)
             self.is_legacy = True
+            self.is_v53 = False
+        elif rwhi_version == 'v5.3':
+            if RWHI_v53 is None:
+                raise RuntimeError('RWHI v5.3 module not found. Check rwhi_v53.py.')
+            self.impl = RWHI_v53(init_cfg=init_cfg, **kwargs)
+            self.is_legacy = False
+            self.is_v53 = True
         else:
+            # 默认使用 v5.2 (RWHI_Ultimate)
             self.impl = RWHI_Ultimate(init_cfg=init_cfg, **kwargs)
             self.is_legacy = False
+            self.is_v53 = False
 
     def forward(self, radar_points=None, radar_mask=None):
         if self.is_legacy:
             return self.impl(radar_points)
         return self.impl(radar_points=radar_points, radar_mask=radar_mask)
+    
+    def encode_alpha(self, alpha_values):
+        """
+        将 α 值编码为 embedding (仅 v5.3 支持)
+        
+        Args:
+            alpha_values: [B, K, 1] 或 [B, K]
+        
+        Returns:
+            alpha_emb: [B, K, d_alpha] 或 None
+        """
+        if self.is_v53 and hasattr(self.impl, 'encode_alpha'):
+            return self.impl.encode_alpha(alpha_values)
+        return None
 
     @property
     def safety_anchors(self):
@@ -425,6 +461,20 @@ class RWHIModule(BaseModule):
     @property
     def num_safety_anchors(self):
         return self.impl.num_safety_anchors
+    
+    @property
+    def d_alpha(self):
+        """α embedding 维度 (仅 v5.3 支持)"""
+        if self.is_v53 and hasattr(self.impl, 'd_alpha'):
+            return self.impl.d_alpha
+        return 0
+    
+    @property
+    def alpha_encoder(self):
+        """获取 AlphaEncoder 模块 (仅 v5.3 支持)"""
+        if self.is_v53 and hasattr(self.impl, 'alpha_encoder'):
+            return self.impl.alpha_encoder
+        return None
 
 
 class RWHIQueryGenerator(BaseModule):

@@ -162,6 +162,11 @@ class RaCFormerHead(DETRHead):
             'max_points': None,
             'radar_channel_map': dict(x=0, y=1, z=2, rcs=3, v_r=4),
             'enabled': True,
+            # v5.3 特有参数
+            'd_alpha': 2,
+            'd_lambda': 1.0,
+            'w_d_max': 2.5,
+            'epsilon': 0.01,
         }
 
         if self.rwhi_cfg is not None:
@@ -172,6 +177,10 @@ class RaCFormerHead(DETRHead):
         rwhi_default_cfg['pc_range'] = self.pc_range
 
         self.rwhi_module = RWHIModule(**rwhi_default_cfg)
+        
+        # 获取 α embedding 维度 (v5.3 支持)
+        self.d_alpha = self.rwhi_module.d_alpha if hasattr(self.rwhi_module, 'd_alpha') else 0
+        self.use_alpha_embedding = self.d_alpha > 0
 
         self.pos2content = nn.Sequential(
             nn.Linear(3, self.embed_dims),
@@ -184,6 +193,21 @@ class RaCFormerHead(DETRHead):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
+        
+        # Feature-Guided Initialization: α embedding 融合层 (v5.3)
+        if self.use_alpha_embedding:
+            # 将 α embedding 融合到 query feature
+            # 输入: [embed_dims + d_alpha], 输出: [embed_dims]
+            self.alpha_fusion = nn.Sequential(
+                nn.Linear(self.embed_dims + self.d_alpha, self.embed_dims),
+                nn.LayerNorm(self.embed_dims),
+            )
+            for module in self.alpha_fusion:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    nn.init.zeros_(module.bias)
+        else:
+            self.alpha_fusion = None
 
         self.init_query_bbox = nn.Embedding(self.num_query, 10)
         nn.init.constant_(self.init_query_bbox.weight[:, 2:3], 0.5)
@@ -219,6 +243,9 @@ class RaCFormerHead(DETRHead):
 
         self.rwhi_module = None
         self.pos2content = None
+        self.d_alpha = 0
+        self.use_alpha_embedding = False
+        self.alpha_fusion = None
 
     def init_weights(self):
         """初始化权重"""
@@ -347,7 +374,7 @@ class RaCFormerHead(DETRHead):
         batch_size = lss_bev_feats.shape[0]
         device = lss_bev_feats.device
 
-        query_bbox, using_dynamic_rwhi = self._prepare_query_bbox(
+        query_bbox, using_dynamic_rwhi, alpha_values = self._prepare_query_bbox(
             batch_size, device, radar_points, img_metas
         )
 
@@ -358,7 +385,8 @@ class RaCFormerHead(DETRHead):
             batch_size,
             device,
             using_dynamic_rwhi,
-            self.label_enc
+            self.label_enc,
+            alpha_values=alpha_values
         )
 
         query_bbox, query_feat, attn_mask, mask_dict = self.prepare_for_dn_input(
@@ -381,8 +409,17 @@ class RaCFormerHead(DETRHead):
         return self._build_output_dict(cls_scores, bbox_preds, mask_dict)
 
     def _prepare_query_bbox(self, batch_size, device, radar_points, img_metas):
-        """准备query边界框"""
+        """
+        准备query边界框
+        
+        Returns:
+            query_bbox: [B, Q, 10] bbox_proposal
+            using_dynamic_rwhi: bool 是否使用动态 RWHI
+            alpha_values: [B, Q, 1] 或 None, 每个 query 的 α 值 (v5.3)
+        """
         using_dynamic_rwhi = False
+        alpha_values = None
+        
         if self.use_rwhi and self.rwhi_module is not None:
             if radar_points is None:
                 radar_points = self._extract_radar_points_from_metas(
@@ -394,7 +431,7 @@ class RaCFormerHead(DETRHead):
                     radar_points, batch_size
                 )
                 radar_mask = (radar_points.abs().sum(dim=-1) > 0)
-                query_bbox, _ = self.rwhi_module(
+                query_bbox, alpha_values = self.rwhi_module(
                     radar_points, radar_mask=radar_mask
                 )
                 using_dynamic_rwhi = True
@@ -402,6 +439,12 @@ class RaCFormerHead(DETRHead):
                     query_bbox, batch_size
                 )
                 query_bbox = self._expand_query_bbox(query_bbox)
+                
+                # 调整 alpha_values batch size
+                if alpha_values is not None:
+                    alpha_values = self._adjust_alpha_batch_size(
+                        alpha_values, batch_size
+                    )
             else:
                 query_bbox = self.init_query_bbox.weight.clone()
                 query_bbox = query_bbox.view(
@@ -413,7 +456,23 @@ class RaCFormerHead(DETRHead):
                 1, self.num_query, 10
             ).repeat(batch_size, 1, 1)
 
-        return query_bbox.to(device), using_dynamic_rwhi
+        return query_bbox.to(device), using_dynamic_rwhi, alpha_values
+    
+    @staticmethod
+    def _adjust_alpha_batch_size(alpha_values, target_batch_size):
+        """调整 alpha_values 的 batch size"""
+        if alpha_values is None:
+            return None
+        
+        alpha_batch_size = alpha_values.shape[0]
+        if alpha_batch_size == target_batch_size:
+            return alpha_values
+        
+        if alpha_batch_size > target_batch_size:
+            return alpha_values[:target_batch_size]
+        
+        repeat_times = (target_batch_size + alpha_batch_size - 1) // alpha_batch_size
+        return alpha_values.repeat(repeat_times, 1, 1)[:target_batch_size]
 
     # 修复: 添加@staticmethod装饰器，该方法不使用self
     @staticmethod
@@ -503,9 +562,23 @@ class RaCFormerHead(DETRHead):
         batch_size,
         device,
         using_dynamic_rwhi,
-        label_enc
+        label_enc,
+        alpha_values=None
     ):
-        """准备query特征"""
+        """
+        准备query特征
+        
+        Args:
+            query_bbox: [B, Q, 10] bbox_proposal
+            batch_size: int
+            device: torch.device
+            using_dynamic_rwhi: bool
+            label_enc: nn.Embedding
+            alpha_values: [B, Q, 1] 或 None, 每个 query 的 α 值 (v5.3)
+        
+        Returns:
+            init_query_feat: [B, Q, embed_dims]
+        """
         if using_dynamic_rwhi and self.pos2content is not None:
             query_pos = query_bbox[..., :3]
             dynamic_content = self.pos2content(query_pos)
@@ -514,6 +587,20 @@ class RaCFormerHead(DETRHead):
                 batch_size, self.num_query, 1, device=device
             )
             init_query_feat = torch.cat([dynamic_content, indicator0], dim=-1)
+            
+            # Feature-Guided Initialization: 融合 α embedding (v5.3)
+            if (self.use_alpha_embedding and 
+                alpha_values is not None and 
+                self.alpha_fusion is not None and
+                self.rwhi_module is not None):
+                # 获取 α embedding
+                alpha_emb = self.rwhi_module.encode_alpha(alpha_values)  # [B, Q, d_alpha]
+                if alpha_emb is not None:
+                    alpha_emb = alpha_emb.to(device=device, dtype=init_query_feat.dtype)
+                    # 拼接 α embedding 到 query feature
+                    feat_with_alpha = torch.cat([init_query_feat, alpha_emb], dim=-1)
+                    # 通过融合层 + LayerNorm
+                    init_query_feat = self.alpha_fusion(feat_with_alpha)
 
             # DDP兼容: 确保init_query_bbox参与计算图
             # 修复: dummy_reg必须添加到输出张量，而不是丢弃到_
@@ -526,8 +613,13 @@ class RaCFormerHead(DETRHead):
                     dummy_rwhi = sum(
                         p.sum() for p in self.rwhi_module.parameters()
                     ) * 0.0
+                dummy_alpha_fusion = 0.0
+                if self.alpha_fusion is not None:
+                    dummy_alpha_fusion = sum(
+                        p.sum() for p in self.alpha_fusion.parameters()
+                    ) * 0.0
                 init_query_feat = (
-                    init_query_feat + dummy_reg + dummy_label + dummy_rwhi
+                    init_query_feat + dummy_reg + dummy_label + dummy_rwhi + dummy_alpha_fusion
                 )
 
             return init_query_feat
@@ -548,7 +640,12 @@ class RaCFormerHead(DETRHead):
             dummy_rwhi = sum(
                 p.sum() for p in self.rwhi_module.parameters()
             ) * 0.0
-            init_query_feat = init_query_feat + dummy_p2c + dummy_rwhi
+            dummy_alpha_fusion = 0.0
+            if self.alpha_fusion is not None:
+                dummy_alpha_fusion = sum(
+                    p.sum() for p in self.alpha_fusion.parameters()
+                ) * 0.0
+            init_query_feat = init_query_feat + dummy_p2c + dummy_rwhi + dummy_alpha_fusion
 
         return init_query_feat
 

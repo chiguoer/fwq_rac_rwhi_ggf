@@ -74,7 +74,17 @@ def encode_bbox(bboxes, pc_range=None):
 def decode_bbox(bboxes, pc_range=None):
     xyz = bboxes[..., 0:3].clone()
     wlh = bboxes[..., 3:6].exp()
-    rot = torch.atan2(bboxes[..., 6:7], bboxes[..., 7:8])
+    # 数值稳定：当 sin、cos 同时接近 0 时，atan2 的反传会产生 NaN，先归一化再取角
+    rot_sin = torch.nan_to_num(bboxes[..., 6:7], nan=0.0)
+    rot_cos = torch.nan_to_num(bboxes[..., 7:8], nan=1.0)
+    # 避免 (0,0) 输入：若 sin、cos 同时极小则强制设为 (0,1)
+    near_zero = (rot_sin.abs() < 1e-4) & (rot_cos.abs() < 1e-4)
+    rot_sin = torch.where(near_zero, torch.zeros_like(rot_sin), rot_sin)
+    rot_cos = torch.where(near_zero, torch.ones_like(rot_cos), rot_cos)
+
+    rot_norm = torch.sqrt(rot_sin * rot_sin + rot_cos * rot_cos + 1e-8)
+    rot_norm = torch.nan_to_num(rot_norm, nan=1.0)
+    rot = torch.atan2(rot_sin / rot_norm, rot_cos / rot_norm)
 
     if pc_range is not None:
         xyz[..., 0] = xyz[..., 0] * (pc_range[3] - pc_range[0]) + pc_range[0]
@@ -134,4 +144,3 @@ def xy2theta_d_coods(xy_coords_norm, map_size=None, r=None, norm=True):
         theta = ((theta + 2 * torch.pi) % (2 * torch.pi))
         theta_d_coods = torch.cat((theta, distances), dim=-1)        
     return torch.cat([theta_d_coods, xy_coords[..., 2:]], dim=-1)
-

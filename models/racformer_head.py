@@ -97,10 +97,19 @@ class RaCFormer_head(DETRHead):
         )
         self.rwhi_module = build_rwhi(**rwhi_params)
         
-        # 使用 RWHI 的 safety_anchors 初始化 init_query_bbox
+        # ✅ 使用 RWHI 的 safety_anchors 初始化 init_query_bbox
+        # 仅复制 θ, d, z, h, sin, cos, vx, vy，保留 w/l 的随机初始化
         with torch.no_grad():
             safety_anchors = self.rwhi_module.safety_anchors
-            self.init_query_bbox.weight.copy_(safety_anchors)
+            # θ, d (indices 0, 1)
+            self.init_query_bbox.weight[:, 0:2].copy_(safety_anchors[:, 0:2])
+            # z (index 2)
+            self.init_query_bbox.weight[:, 2].copy_(safety_anchors[:, 2])
+            # w, l (indices 3, 4) - 保留随机初始化，不复制！
+            # h (index 5)
+            self.init_query_bbox.weight[:, 5].copy_(safety_anchors[:, 5])
+            # sin, cos, vx, vy (indices 6, 7, 8, 9)
+            self.init_query_bbox.weight[:, 6:10].copy_(safety_anchors[:, 6:10])
         
         # pos2content: 将位置 [θ, d, z] 转换为内容特征
         # 输出维度为 embed_dims - 1，留 1 维给 indicator
@@ -110,6 +119,10 @@ class RaCFormer_head(DETRHead):
             nn.ReLU(inplace=True),
             nn.Linear(self.embed_dims, self.embed_dims - 1),
         )
+        # ✅ Fix 3: 零初始化最后一层，使 RWHI 初始时接近 identity
+        # 这样 fused_content ≈ 0，label_enc_base + fused_content ≈ label_enc_base
+        nn.init.zeros_(self.pos2content[-1].weight)
+        nn.init.zeros_(self.pos2content[-1].bias)
         
         # alpha_fusion: 融合 α embedding
         d_alpha = self.rwhi_module.d_alpha
@@ -117,6 +130,10 @@ class RaCFormer_head(DETRHead):
             nn.Linear(self.embed_dims - 1 + d_alpha, self.embed_dims - 1),
             nn.LayerNorm(self.embed_dims - 1),
         )
+        # ✅ 可学习门控标量，初始化为 0.5，控制 RWHI 特征的权重
+        # gate=0.5 表示 label_enc 和 fused_content 各占一半权重
+        # 相比零初始化，这允许 RWHI 特征从一开始就有贡献，同时保持平滑过渡
+        self.rwhi_gate = nn.Parameter(torch.tensor(0.5))
 
     def init_weights(self):
         self.transformer.init_weights()
@@ -155,14 +172,17 @@ class RaCFormer_head(DETRHead):
         """
         validated = query_bbox.clone()
         
-        # theta: [0, 1-EPS]
-        validated[..., 0] = validated[..., 0].clamp(min=0.0, max=1.0 - EPS)
+        # out-of-place clamp 避免版本冲突
+        theta = validated[..., 0].clamp(min=0.0, max=1.0 - EPS)
+        d = validated[..., 1].clamp(min=EPS, max=1.0 - EPS)
+        z = validated[..., 2].clamp(min=EPS, max=1.0 - EPS)
         
-        # d: (EPS, 1-EPS) - 必须严格开区间，避免 inverse_sigmoid 溢出
-        validated[..., 1] = validated[..., 1].clamp(min=EPS, max=1.0 - EPS)
-        
-        # z: (EPS, 1-EPS) - 必须严格开区间
-        validated[..., 2] = validated[..., 2].clamp(min=EPS, max=1.0 - EPS)
+        validated = torch.cat([
+            theta.unsqueeze(-1),
+            d.unsqueeze(-1),
+            z.unsqueeze(-1),
+            validated[..., 3:],
+        ], dim=-1)
         
         return validated
 
@@ -194,6 +214,18 @@ class RaCFormer_head(DETRHead):
             if has_valid_points:
                 # 使用 RWHI 生成动态锚点
                 query_bbox, alpha_values = self.rwhi_module(radar_points, radar_mask)
+                
+                # ✅ 使用 init_query_bbox 的 w/l 替代动态采样，保持确定性和可学习性
+                # 动态路径仅提供 θ/d/z（雷达引导），w/l 来自 init_query_bbox（与静态路径一致）
+                # 注意：必须在slice后立即clone()，断开与原始weight的view关系，避免计算图版本冲突
+                wl_from_init = self.init_query_bbox.weight[:, 3:5].clone()  # [K, 2] - clone断开view
+                wl_from_init = wl_from_init.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, K, 2]
+                query_bbox = torch.cat([
+                    query_bbox[..., :3],      # θ, d, z (来自 RWHI)
+                    wl_from_init,             # w, l (来自 init_query_bbox)
+                    query_bbox[..., 5:],      # h, sin, cos, vx, vy
+                ], dim=-1)
+                
                 query_bbox = self._validate_query_bbox(query_bbox)
                 using_dynamic_rwhi = True
             else:
@@ -246,9 +278,23 @@ class RaCFormer_head(DETRHead):
             feat_with_alpha = torch.cat([dynamic_content, alpha_emb], dim=-1)
             fused_content = self.alpha_fusion(feat_with_alpha)  # [B, K, embed_dims-1]
             
+            # ✅ Fix 1: 添加语义桥接 - 保留 label_enc 语义先验
+            # RWHI 特征作为增强而非替换，使用残差连接
+            label_enc_base = self.label_enc.weight[self.num_classes].repeat(self.num_query, 1)
+            label_enc_base = label_enc_base.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, K, embed_dims-1]
+            
+            # ✅ AMP dtype fix: Cast label_enc_base to match fused_content dtype
+            # label_enc.weight stays fp32, but fused_content may be fp16 under AMP
+            label_enc_base = label_enc_base.to(dtype=fused_content.dtype)
+            
+            # ✅ Gated fusion: 使用可学习门控 (初始0.5) 控制 RWHI 特征权重
+            # query_feat = label_enc_base + gate * fused_content
+            # gate=0.5 时，RWHI 从一开始就有一半贡献，避免零初始化的梯度延迟问题
+            query_feat_content = label_enc_base + self.rwhi_gate * fused_content
+            
             # 添加 indicator
             indicator = indicator0.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, K, 1]
-            query_feat = torch.cat([fused_content, indicator], dim=-1)  # [B, K, embed_dims]
+            query_feat = torch.cat([query_feat_content, indicator], dim=-1)  # [B, K, embed_dims]
         else:
             # 原始方式
             init_query_feat = self.label_enc.weight[self.num_classes].repeat(self.num_query, 1)

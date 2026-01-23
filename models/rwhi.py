@@ -346,10 +346,13 @@ class RWHIModule(BaseModule):
         # z (归一化)
         anchors[:, 2] = self.z_default
         
-        # w, l, h (log 空间)
-        anchors[:, 3] = math.log(max(self.w_default, 0.1))
-        anchors[:, 4] = math.log(max(self.l_default, 0.1))
-        anchors[:, 5] = math.log(max(self.h_default, 0.1))
+        # ✅ Fix 2a: 保留原始 RaCFormer 初始化
+        # - w, l: 设为占位符值，实际不会被复制到 init_query_bbox
+        #   (racformer_head.py 只复制 θ, d, z, h, sin, cos, vx, vy，保留 w/l 随机初始化)
+        # - h: 设为 0.2，匹配原始 nn.init.constant_(..., 0.2)
+        anchors[:, 3] = 0.0  # w: 占位符，不会被复制 (保留 init_query_bbox 随机值)
+        anchors[:, 4] = 0.0  # l: 占位符，不会被复制 (保留 init_query_bbox 随机值)
+        anchors[:, 5] = 0.2  # h: ✅ 匹配原始值 exp(0.2)≈1.22m
         
         # sin, cos (yaw=0)
         anchors[:, 6] = 0.0  # sin(0)
@@ -592,17 +595,18 @@ class RWHIModule(BaseModule):
             dtype=dtype  # 【修复】
         ).clamp(min=EPS, max=1.0 - EPS)
         
-        # wlh (log 空间)
-        w_log = math.log(max(self.w_default, 0.1))
-        l_log = math.log(max(self.l_default, 0.1))
-        h_log = math.log(max(self.h_default, 0.1))
+        # ✅ Fix 2b: w/l 占位符，实际值由 racformer_head 从 init_query_bbox 替换
+        # 这里只是占位，确保输出维度正确，w/l 会在 _prepare_query_bbox 中被替换
+        # h: 设为 0.2，匹配原始值 exp(0.2)≈1.22m
+        h_log = 0.2  # ✅ 匹配原始值
         
         # 组装 10 维 【修复】所有 torch.full 添加 dtype
+        # 注意：w/l (indices 3,4) 是占位符，会被 racformer_head 用 init_query_bbox 的值替换
         anchors = torch.cat([
-            theta_d,  # [B, K, 2] (θ, d)
+            theta_d,  # [B, K, 2] (θ, d) - 来自 RWHI 打分图
             z,        # [B, K, 1]
-            torch.full((batch_size, K, 1), w_log, device=device, dtype=dtype),  # w (log)
-            torch.full((batch_size, K, 1), l_log, device=device, dtype=dtype),  # l (log)
+            torch.zeros((batch_size, K, 1), device=device, dtype=dtype),  # w 占位符
+            torch.zeros((batch_size, K, 1), device=device, dtype=dtype),  # l 占位符
             torch.full((batch_size, K, 1), h_log, device=device, dtype=dtype),  # h (log)
             torch.full((batch_size, K, 1), 0.0, device=device, dtype=dtype),    # sin(yaw)
             torch.full((batch_size, K, 1), 1.0, device=device, dtype=dtype),    # cos(yaw)
@@ -641,7 +645,8 @@ class RWHIModule(BaseModule):
             B = radar_points.shape[0]
             device = radar_points.device
             dtype = radar_points.dtype  # 【修复】AMP/FP16 兼容性
-            anchors = self.safety_anchors.unsqueeze(0).expand(B, -1, -1).to(device=device, dtype=dtype)
+            # 注意：必须使用 repeat() 或 clone() 而非 expand()，避免计算图版本冲突
+            anchors = self.safety_anchors.unsqueeze(0).repeat(B, 1, 1).to(device=device, dtype=dtype)
             alpha_values = torch.full((B, self.num_query, 1), 0.5, device=device, dtype=dtype)
             return anchors, alpha_values
         

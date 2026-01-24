@@ -117,7 +117,7 @@ class RWHIModule(BaseModule):
     
     打分公式：
     S(x,y) = C_base + I_radar(x,y) + ε * J(x,y)
-    S_final = S + γ * (MaxPool3x3(S) - S)
+    S_final = S + γ * (Diffusion(S) - S)，可配置类型/核大小
     
     I_radar 公式：
     I_radar(点) = α * log(1 + σ_proc * w_v * w_d)
@@ -139,7 +139,9 @@ class RWHIModule(BaseModule):
         # 打分场参数
         base_bias=1.0,
         epsilon=0.01,
-        diffusion_gamma=0.5,
+        diffusion_gamma=0.2,
+        diffusion_type='max',
+        diffusion_kernel=3,
         diffusion_s_max=5.0,
         # 默认值
         z_default=0.5,
@@ -150,12 +152,18 @@ class RWHIModule(BaseModule):
         alpha_mlp_in_dim=3,
         alpha_mlp_hidden=32,
         alpha_init_bias=1.0,
+        alpha_const=0.7,
+        use_alpha=True,
         # AlphaEncoder 参数
         d_alpha=2,
         alpha_encoder_hidden=8,
         # 其他
         num_clusters=6,
         max_points=5000,
+        num_rwhi=None,
+        enable_diverse_topk=False,
+        coarse_factor=4,
+        max_per_cell=5,
         enabled=True,
         init_cfg=None,
         **kwargs
@@ -174,7 +182,9 @@ class RWHIModule(BaseModule):
             beta: 速度权重系数
             base_bias: 基础分数 C_base
             epsilon: 微扰层系数
-            diffusion_gamma: 空间扩散系数
+            diffusion_gamma: 空间扩散系数 λ（默认 0.2）
+            diffusion_type: 扩散类型 ('max'/'avg'/'none')
+            diffusion_kernel: 扩散核尺寸 (1/2/3)，为1或type='none'时跳过扩散
             diffusion_s_max: 得分上限
             z_default: 默认归一化高度
             w_default: 默认物体宽度 (物理值，会转为 log)
@@ -183,10 +193,16 @@ class RWHIModule(BaseModule):
             alpha_mlp_in_dim: AlphaMLP 输入维度
             alpha_mlp_hidden: AlphaMLP 隐藏层维度
             alpha_init_bias: AlphaMLP 初始偏置
+            alpha_const: use_alpha=False 时使用的常数 α
+            use_alpha: 是否启用 AlphaMLP/Encoder
             d_alpha: α embedding 维度
             alpha_encoder_hidden: AlphaEncoder 隐藏层维度
             num_clusters: 距离层数量 (用于 safety_anchors 生成)
             max_points: 最大雷达点数
+            num_rwhi: 雷达 Top-K 锚点数量（<=0 时不启用）
+            enable_diverse_topk: 是否启用粗粒度 Top-K 多样性约束
+            coarse_factor: coarse cell 的缩放因子
+            max_per_cell: 每个 coarse cell 的最大锚点数
             enabled: 是否启用 RWHI
         """
         super().__init__(init_cfg)
@@ -213,6 +229,8 @@ class RWHIModule(BaseModule):
         self.base_bias = base_bias
         self.epsilon = epsilon
         self.diffusion_gamma = diffusion_gamma
+        self.diffusion_type = diffusion_type.lower()
+        self.diffusion_kernel = int(diffusion_kernel)
         self.diffusion_s_max = diffusion_s_max
         
         # 默认值
@@ -223,7 +241,17 @@ class RWHIModule(BaseModule):
         
         # 其他参数
         self.max_points = max_points
-        self._d_alpha = d_alpha
+        self.use_alpha = use_alpha
+        self.alpha_const = alpha_const
+        self._d_alpha = d_alpha if use_alpha else 0
+        self.num_rwhi = int(num_rwhi) if num_rwhi is not None else self.num_query
+        self.enable_diverse_topk = enable_diverse_topk
+        self.coarse_factor = int(coarse_factor)
+        self.max_per_cell = int(max_per_cell)
+        if self.coarse_factor < 1:
+            raise ValueError(f"coarse_factor 需要 >=1，得到 {self.coarse_factor}")
+        if self.max_per_cell < 1:
+            raise ValueError(f"max_per_cell 需要 >=1，得到 {self.max_per_cell}")
         
         # 计算 BEV 网格参数
         # 【修复】分别计算 x/y 范围，并断言正方形
@@ -235,23 +263,43 @@ class RWHIModule(BaseModule):
         self.grid_resolution = self.map_size / bev_grid_size
         
         # 初始化子模块
-        self.alpha_mlp = AlphaMLP(
-            in_dim=alpha_mlp_in_dim,
-            hidden_dim=alpha_mlp_hidden,
-            init_bias=alpha_init_bias
-        )
+        if self.use_alpha:
+            self.alpha_mlp = AlphaMLP(
+                in_dim=alpha_mlp_in_dim,
+                hidden_dim=alpha_mlp_hidden,
+                init_bias=alpha_init_bias
+            )
+            
+            self.alpha_encoder = AlphaEncoder(
+                d_alpha=d_alpha,
+                hidden_dim=alpha_encoder_hidden
+            )
+        else:
+            self.alpha_mlp = None
+            self.alpha_encoder = None
         
-        self.alpha_encoder = AlphaEncoder(
-            d_alpha=d_alpha,
-            hidden_dim=alpha_encoder_hidden
-        )
-        
-        # 空间扩散层 (MaxPool3x3)
-        self.diffusion = nn.MaxPool2d(
-            kernel_size=3,
-            stride=1,
-            padding=1
-        )
+        # 空间扩散层
+        if self.diffusion_type not in ['max', 'avg', 'none']:
+            raise ValueError(f"diffusion_type 必须是 'max'/'avg'/'none'，但得到 {self.diffusion_type}")
+        if self.diffusion_kernel < 1:
+            raise ValueError(f"diffusion_kernel 需要 >=1，得到 {self.diffusion_kernel}")
+        if self.diffusion_type == 'none' or self.diffusion_kernel <= 1:
+            self.diffusion = None
+            self._diffusion_even = False
+        elif self.diffusion_type == 'max':
+            self._diffusion_even = (self.diffusion_kernel % 2 == 0)
+            self.diffusion = nn.MaxPool2d(
+                kernel_size=self.diffusion_kernel,
+                stride=1,
+                padding=0 if self._diffusion_even else self.diffusion_kernel // 2
+            )
+        else:
+            self._diffusion_even = (self.diffusion_kernel % 2 == 0)
+            self.diffusion = nn.AvgPool2d(
+                kernel_size=self.diffusion_kernel,
+                stride=1,
+                padding=0 if self._diffusion_even else self.diffusion_kernel // 2
+            )
         
         # 预计算 BEV 网格坐标
         self._init_grid()
@@ -298,6 +346,38 @@ class RWHIModule(BaseModule):
         # 注册为 buffer
         self.register_buffer('jitter_field', jitter)
     
+    def _build_uniform_anchors(self, num_anchors):
+        """
+        构建均匀极坐标分布的锚点模板 [num_anchors, 10]
+        """
+        num_clusters = self.num_clusters
+        num_angles = math.ceil(num_anchors / num_clusters)
+        
+        angles = torch.linspace(0, 1, num_angles + 1)[:-1]  # [0, 1)
+        distances = torch.linspace(0, 1, num_clusters + 2)[1:-1]  # (0, 1)
+        
+        angles = angles.view(num_angles, 1).expand(num_angles, num_clusters)
+        distances = distances.view(1, num_clusters).expand(num_angles, num_clusters)
+        theta_d = torch.stack([angles, distances], dim=-1).flatten(0, 1)  # [num_angles * num_clusters, 2]
+        
+        if theta_d.shape[0] > num_anchors:
+            theta_d = theta_d[:num_anchors]
+        
+        theta_d[:, 1] = theta_d[:, 1].clamp(min=EPS, max=1.0 - EPS)
+        
+        anchors = torch.zeros(theta_d.shape[0], 10)
+        anchors[:, 0] = theta_d[:, 0]
+        anchors[:, 1] = theta_d[:, 1]
+        anchors[:, 2] = self.z_default
+        anchors[:, 3] = 0.0  # w 占位符
+        anchors[:, 4] = 0.0  # l 占位符
+        anchors[:, 5] = 0.2  # h: 与原版一致
+        anchors[:, 6] = 0.0
+        anchors[:, 7] = 1.0
+        anchors[:, 8] = 0.0
+        anchors[:, 9] = 0.0
+        return anchors
+    
     @property
     def d_alpha(self):
         """返回 α embedding 维度"""
@@ -310,59 +390,9 @@ class RWHIModule(BaseModule):
         
         生成均匀极坐标分布作为安全默认值
         
-        【注意】处理 num_query 不能被 num_clusters 整除的情况：
-        - 使用 ceil 确保生成足够的锚点
-        - 最后截取 num_query 个
+        【注意】处理 num_query 不能被 num_clusters 整除的情况：使用 ceil 生成足够的锚点并截断
         """
-        # 【修复】使用配置的 num_clusters 而不是硬编码的 6
-        num_clusters = self.num_clusters
-        # 【修复】使用 ceil 处理不整除情况，确保锚点数量 >= num_query
-        num_angles = math.ceil(self.num_query / num_clusters)
-        
-        angles = torch.linspace(0, 1, num_angles + 1)[:-1]  # [0, 1)
-        distances = torch.linspace(0, 1, num_clusters + 2)[1:-1]  # (0, 1)
-        
-        # 组合
-        angles = angles.view(num_angles, 1).expand(num_angles, num_clusters)
-        distances = distances.view(1, num_clusters).expand(num_angles, num_clusters)
-        
-        theta_d = torch.stack([angles, distances], dim=-1).flatten(0, 1)  # [num_angles * num_clusters, 2]
-        
-        # 【修复】截取到 num_query 个，处理不整除情况
-        if theta_d.shape[0] > self.num_query:
-            theta_d = theta_d[:self.num_query]
-        
-        # 确保 d 在 (EPS, 1-EPS) 范围内
-        theta_d[:, 1] = theta_d[:, 1].clamp(min=EPS, max=1.0 - EPS)
-        
-        # 构建完整 10 维
-        Q = theta_d.shape[0]
-        anchors = torch.zeros(Q, 10)
-        
-        # θ, d
-        anchors[:, 0] = theta_d[:, 0]
-        anchors[:, 1] = theta_d[:, 1]
-        
-        # z (归一化)
-        anchors[:, 2] = self.z_default
-        
-        # ✅ Fix 2a: 保留原始 RaCFormer 初始化
-        # - w, l: 设为占位符值，实际不会被复制到 init_query_bbox
-        #   (racformer_head.py 只复制 θ, d, z, h, sin, cos, vx, vy，保留 w/l 随机初始化)
-        # - h: 设为 0.2，匹配原始 nn.init.constant_(..., 0.2)
-        anchors[:, 3] = 0.0  # w: 占位符，不会被复制 (保留 init_query_bbox 随机值)
-        anchors[:, 4] = 0.0  # l: 占位符，不会被复制 (保留 init_query_bbox 随机值)
-        anchors[:, 5] = 0.2  # h: ✅ 匹配原始值 exp(0.2)≈1.22m
-        
-        # sin, cos (yaw=0)
-        anchors[:, 6] = 0.0  # sin(0)
-        anchors[:, 7] = 1.0  # cos(0)
-        
-        # vx, vy
-        anchors[:, 8] = 0.0
-        anchors[:, 9] = 0.0
-        
-        return anchors
+        return self._build_uniform_anchors(self.num_query)
     
     def _prepare_alpha_input(self, radar_points, radar_mask):
         """
@@ -514,8 +544,18 @@ class RWHIModule(BaseModule):
         S = base_field + i_radar_map + jitter
         
         # 残差式空间扩散
-        S_pool = self.diffusion(S)
-        S_final = S + self.diffusion_gamma * (S_pool - S)
+        use_diffusion = self.diffusion is not None and self.diffusion_gamma != 0.0
+        if use_diffusion:
+            if self._diffusion_even:
+                pad = self.diffusion_kernel - 1
+                S_pad = F.pad(S, (0, pad, 0, pad))
+                S_pool = self.diffusion(S_pad)
+            else:
+                S_pool = self.diffusion(S)
+            S_final = S + self.diffusion_gamma * (S_pool - S)
+        else:
+            # diffusion_type='none'、kernel=1 或 gamma=0 时直接跳过扩散
+            S_final = S
         
         # 得分上限裁剪
         if self.diffusion_s_max > 0:
@@ -550,8 +590,66 @@ class RWHIModule(BaseModule):
         d_norm = (dist / R_MAX).clamp(min=EPS, max=1.0 - EPS)
         
         return torch.stack([theta_norm, d_norm], dim=-1)
+
+    def _select_topk_indices(self, S_flat, H, W, K):
+        """
+        选择 Top-K 索引，可选 coarse cell 多样性约束。
+        """
+        total = H * W
+        K_eff = min(K, total)
+        if not self.enable_diverse_topk:
+            _, topk_idx = torch.topk(S_flat, K_eff, dim=1)
+            if K_eff < K:
+                pad = topk_idx[:, -1:].repeat(1, K - K_eff)
+                topk_idx = torch.cat([topk_idx, pad], dim=1)
+            return topk_idx
+
+        coarse_factor = self.coarse_factor
+        coarse_w = max(W // coarse_factor, 1)
+        coarse_h = max(H // coarse_factor, 1)
+        max_cells = coarse_w * coarse_h
+        device = S_flat.device
+        topk_idx_list = []
+
+        for b in range(S_flat.shape[0]):
+            sorted_idx = torch.argsort(S_flat[b], descending=True).tolist()
+            counts = [0] * max_cells
+            selected = []
+            selected_set = set()
+
+            for idx in sorted_idx:
+                y = idx // W
+                x = idx % W
+                cy = y // coarse_factor
+                cx = x // coarse_factor
+                if cy >= coarse_h:
+                    cy = coarse_h - 1
+                if cx >= coarse_w:
+                    cx = coarse_w - 1
+                coarse_id = cy * coarse_w + cx
+                if counts[coarse_id] < self.max_per_cell:
+                    counts[coarse_id] += 1
+                    selected.append(idx)
+                    selected_set.add(idx)
+                    if len(selected) == K_eff:
+                        break
+
+            if len(selected) < K_eff:
+                for idx in sorted_idx:
+                    if idx not in selected_set:
+                        selected.append(idx)
+                        if len(selected) == K_eff:
+                            break
+
+            if len(selected) < K:
+                last_idx = selected[-1] if selected else 0
+                selected.extend([last_idx] * (K - len(selected)))
+
+            topk_idx_list.append(torch.tensor(selected, device=device, dtype=torch.long))
+
+        return torch.stack(topk_idx_list, dim=0)
     
-    def _topk_to_anchors(self, S, alpha_map, batch_size, device):
+    def _topk_to_anchors(self, S, alpha_map, batch_size, device, topk_k=None):
         """
         从打分图提取 Top-K 位置，转换为 10 维锚点
         
@@ -570,12 +668,12 @@ class RWHIModule(BaseModule):
             alpha_topk: [B, K, 1] Top-K 位置的 α 值
         """
         H = W = self.bev_grid_size
-        K = self.num_query
+        K = topk_k if topk_k is not None else self.num_query
         dtype = S.dtype  # 【修复】AMP/FP16 兼容性
         
         # Top-K
         S_flat = S.view(batch_size, -1)  # [B, H*W]
-        _, topk_idx = torch.topk(S_flat, K, dim=1)  # [B, K]
+        topk_idx = self._select_topk_indices(S_flat, H, W, K)  # [B, K]
         
         # 获取 α
         alpha_flat = alpha_map.view(batch_size, -1)  # [B, H*W]
@@ -626,6 +724,10 @@ class RWHIModule(BaseModule):
         Returns:
             embedding: [B, K, d_alpha] α embedding
         """
+        if not self.use_alpha or self.alpha_encoder is None or self._d_alpha == 0:
+            # 返回零向量，占位保持接口兼容
+            B, K, _ = alpha_values.shape
+            return alpha_values.new_zeros(B, K, self._d_alpha)
         return self.alpha_encoder(alpha_values)
     
     def forward(self, radar_points, radar_mask):
@@ -647,15 +749,19 @@ class RWHIModule(BaseModule):
             dtype = radar_points.dtype  # 【修复】AMP/FP16 兼容性
             # 注意：必须使用 repeat() 或 clone() 而非 expand()，避免计算图版本冲突
             anchors = self.safety_anchors.unsqueeze(0).repeat(B, 1, 1).to(device=device, dtype=dtype)
-            alpha_values = torch.full((B, self.num_query, 1), 0.5, device=device, dtype=dtype)
+            alpha_values = torch.full((B, self.num_query, 1), self.alpha_const, device=device, dtype=dtype)
             return anchors, alpha_values
         
         B, M, C = radar_points.shape
         device = radar_points.device
+        dtype = radar_points.dtype
         
         # 1. 计算每个点的 α
-        f_in = self._prepare_alpha_input(radar_points, radar_mask)  # [B, M, 3]
-        alpha = self.alpha_mlp(f_in)  # [B, M, 1]
+        if self.use_alpha and self.alpha_mlp is not None:
+            f_in = self._prepare_alpha_input(radar_points, radar_mask)  # [B, M, 3]
+            alpha = self.alpha_mlp(f_in)  # [B, M, 1]
+        else:
+            alpha = torch.full((B, M, 1), self.alpha_const, device=device, dtype=dtype)
         
         # 2. 计算 I_radar
         i_radar = self._compute_i_radar(radar_points, radar_mask, alpha)  # [B, M]
@@ -667,33 +773,56 @@ class RWHIModule(BaseModule):
         
         # 4. 同时聚合 α (用于后续提取)
         # 这里简单取每个格子的平均 α
-        alpha_squeezed = alpha.squeeze(-1)  # [B, M]
-        alpha_sum_map = self._scatter_to_bev(
-            radar_points, alpha_squeezed, radar_mask, B, device
-        )
-        count_map = self._scatter_to_bev(
-            radar_points,
-            torch.ones_like(alpha_squeezed),
-            radar_mask, B, device
-        )
-        alpha_map = alpha_sum_map / (count_map + 1e-6)
-        
-        # 对无雷达点的区域设置默认 α
-        no_radar_mask = (count_map < 0.5)
-        # 【修复】AMP/FP16 兼容性：使用与 alpha_map 相同的 dtype
-        alpha_map = torch.where(no_radar_mask, 
-                                torch.tensor(0.5, device=device, dtype=alpha_map.dtype), 
-                                alpha_map)
+        if self.use_alpha and self.alpha_mlp is not None:
+            alpha_squeezed = alpha.squeeze(-1)  # [B, M]
+            alpha_sum_map = self._scatter_to_bev(
+                radar_points, alpha_squeezed, radar_mask, B, device
+            )
+            count_map = self._scatter_to_bev(
+                radar_points,
+                torch.ones_like(alpha_squeezed),
+                radar_mask, B, device
+            )
+            alpha_map = alpha_sum_map / (count_map + 1e-6)
+            
+            # 对无雷达点的区域设置默认 α
+            no_radar_mask = (count_map < 0.5)
+            alpha_const_tensor = torch.tensor(self.alpha_const, device=device, dtype=alpha_map.dtype)
+            alpha_map = torch.where(no_radar_mask, alpha_const_tensor, alpha_map)
+        else:
+            alpha_map = torch.full(
+                (B, 1, self.bev_grid_size, self.bev_grid_size),
+                self.alpha_const,
+                device=device,
+                dtype=dtype
+            )
         
         # 5. 构建三层打分场
         S_final = self._build_score_map(i_radar_map, B, device)  # [B, 1, H, W]
         
-        # 6. Top-K 选取
-        anchors, alpha_topk = self._topk_to_anchors(
-            S_final, alpha_map, B, device
+        # 6. Top-K 选取（根据 num_rwhi 控制模式）
+        num_rwhi = min(max(self.num_rwhi, 0), self.num_query)
+        if num_rwhi <= 0:
+            anchors = self.safety_anchors.unsqueeze(0).repeat(B, 1, 1).to(device=device, dtype=dtype)
+            alpha_values = torch.full((B, self.num_query, 1), self.alpha_const, device=device, dtype=dtype)
+            return anchors, alpha_values
+
+        num_base = self.num_query - num_rwhi
+        anchors_topk, alpha_topk = self._topk_to_anchors(
+            S_final, alpha_map, B, device, topk_k=num_rwhi
         )  # [B, K, 10], [B, K, 1]
         
-        return anchors, alpha_topk
+        if num_base > 0:
+            # 基础锚点不依赖雷达，α 固定为 alpha_const
+            base_anchors = self._build_uniform_anchors(num_base).to(device=device, dtype=S_final.dtype)
+            base_anchors = base_anchors.unsqueeze(0).repeat(B, 1, 1)
+            base_alpha = torch.full((B, num_base, 1), self.alpha_const, device=device, dtype=alpha_topk.dtype)
+            anchors = torch.cat([base_anchors, anchors_topk], dim=1)
+            alpha_values = torch.cat([base_alpha, alpha_topk], dim=1)
+        else:
+            anchors, alpha_values = anchors_topk, alpha_topk
+        
+        return anchors, alpha_values
 
 
 # 工厂函数，用于根据版本创建 RWHI 模块

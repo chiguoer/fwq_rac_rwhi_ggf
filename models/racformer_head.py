@@ -31,6 +31,9 @@ class RaCFormer_head(DETRHead):
                  test_cfg=dict(max_per_img=100),
                  # RWHI 相关参数
                  use_rwhi=False,
+                 use_alpha=True,
+                 rwhi_gate_init=0.2,
+                 rwhi_gate_const=0.7,
                  rwhi_cfg=None,
                  polar_radius=None,
                  **kwargs):
@@ -47,7 +50,11 @@ class RaCFormer_head(DETRHead):
 
         # RWHI 相关
         self.use_rwhi = use_rwhi
+        self.use_alpha = use_alpha
+        self.rwhi_gate_init = rwhi_gate_init
+        self._rwhi_gate_const_value = rwhi_gate_const
         self.rwhi_cfg = rwhi_cfg if rwhi_cfg is not None else {}
+        self.rwhi_cfg.setdefault('use_alpha', self.use_alpha)
         
         # 全链路统一的极坐标半径
         self.polar_radius = polar_radius if polar_radius is not None else R_MAX
@@ -125,15 +132,18 @@ class RaCFormer_head(DETRHead):
         nn.init.zeros_(self.pos2content[-1].bias)
         
         # alpha_fusion: 融合 α embedding
-        d_alpha = self.rwhi_module.d_alpha
-        self.alpha_fusion = nn.Sequential(
-            nn.Linear(self.embed_dims - 1 + d_alpha, self.embed_dims - 1),
-            nn.LayerNorm(self.embed_dims - 1),
-        )
-        # ✅ 可学习门控标量，初始化为 0.5，控制 RWHI 特征的权重
-        # gate=0.5 表示 label_enc 和 fused_content 各占一半权重
-        # 相比零初始化，这允许 RWHI 特征从一开始就有贡献，同时保持平滑过渡
-        self.rwhi_gate = nn.Parameter(torch.tensor(0.5))
+        if self.use_alpha:
+            d_alpha = self.rwhi_module.d_alpha
+            self.alpha_fusion = nn.Sequential(
+                nn.Linear(self.embed_dims - 1 + d_alpha, self.embed_dims - 1),
+                nn.LayerNorm(self.embed_dims - 1),
+            )
+            # Learnable gate for alpha-enabled mode
+            self.rwhi_gate = nn.Parameter(torch.tensor(self.rwhi_gate_init))
+        else:
+            self.alpha_fusion = None
+            self.rwhi_gate = None
+            self.register_buffer('rwhi_gate_const', torch.tensor(self._rwhi_gate_const_value))
 
     def init_weights(self):
         self.transformer.init_weights()
@@ -206,8 +216,9 @@ class RaCFormer_head(DETRHead):
         """
         using_dynamic_rwhi = False
         alpha_values = None
+        num_rwhi = self.rwhi_cfg.get('num_rwhi', self.num_query)
         
-        if self.use_rwhi and radar_points is not None:
+        if self.use_rwhi and radar_points is not None and num_rwhi > 0:
             # 【修复】检查是否有有效雷达点，使用 .item() 避免 tensor 在布尔上下文中的问题
             has_valid_points = radar_mask is not None and radar_mask.sum().item() > 0
             
@@ -266,17 +277,12 @@ class RaCFormer_head(DETRHead):
         dtype = query_bbox.dtype
         indicator0 = torch.zeros([self.num_query, 1], device=device, dtype=dtype)
         
-        if using_dynamic_rwhi and alpha_values is not None:
+        if using_dynamic_rwhi:
             # 动态 query_feat
             query_pos = query_bbox[..., :3]  # [B, K, 3] (θ, d, z)
             
             # 位置 → 内容
             dynamic_content = self.pos2content(query_pos)  # [B, K, embed_dims-1]
-            
-            # α embedding 融合
-            alpha_emb = self.rwhi_module.encode_alpha(alpha_values)  # [B, K, d_alpha]
-            feat_with_alpha = torch.cat([dynamic_content, alpha_emb], dim=-1)
-            fused_content = self.alpha_fusion(feat_with_alpha)  # [B, K, embed_dims-1]
             
             # ✅ Fix 1: 添加语义桥接 - 保留 label_enc 语义先验
             # RWHI 特征作为增强而非替换，使用残差连接
@@ -285,12 +291,19 @@ class RaCFormer_head(DETRHead):
             
             # ✅ AMP dtype fix: Cast label_enc_base to match fused_content dtype
             # label_enc.weight stays fp32, but fused_content may be fp16 under AMP
-            label_enc_base = label_enc_base.to(dtype=fused_content.dtype)
-            
-            # ✅ Gated fusion: 使用可学习门控 (初始0.5) 控制 RWHI 特征权重
-            # query_feat = label_enc_base + gate * fused_content
-            # gate=0.5 时，RWHI 从一开始就有一半贡献，避免零初始化的梯度延迟问题
-            query_feat_content = label_enc_base + self.rwhi_gate * fused_content
+            label_enc_base = label_enc_base.to(dtype=dynamic_content.dtype)
+
+            if self.use_alpha:
+                # α embedding 融合
+                alpha_emb = self.rwhi_module.encode_alpha(alpha_values)  # [B, K, d_alpha]
+                feat_with_alpha = torch.cat([dynamic_content, alpha_emb], dim=-1)
+                fused_content = self.alpha_fusion(feat_with_alpha)  # [B, K, embed_dims-1]
+                query_feat_content = label_enc_base + self.rwhi_gate * fused_content
+            else:
+                gate = self.rwhi_gate_const
+                if isinstance(gate, torch.Tensor):
+                    gate = gate.to(dtype=dynamic_content.dtype)
+                query_feat_content = label_enc_base + gate * dynamic_content
             
             # 添加 indicator
             indicator = indicator0.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, K, 1]
@@ -309,12 +322,18 @@ class RaCFormer_head(DETRHead):
             
             if self.use_rwhi:
                 # RWHI 相关模块
-                for module in [self.pos2content, self.alpha_fusion]:
+                modules = [self.pos2content]
+                if self.alpha_fusion is not None:
+                    modules.append(self.alpha_fusion)
+                for module in modules:
                     for param in module.parameters():
                         term = param.sum() * 0.0
                         dummy = term if dummy is None else dummy + term
                 for param in self.rwhi_module.parameters():
                     term = param.sum() * 0.0
+                    dummy = term if dummy is None else dummy + term
+                if isinstance(self.rwhi_gate, nn.Parameter):
+                    term = self.rwhi_gate.sum() * 0.0
                     dummy = term if dummy is None else dummy + term
                 
                 # 【新增修复】当使用动态 RWHI 时，init_query_bbox 未参与计算

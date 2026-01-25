@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.runner import force_fp32
 from mmdet.core import multi_apply, reduce_mean
 from mmdet.models import HEADS
@@ -34,6 +35,7 @@ class RaCFormer_head(DETRHead):
                  use_alpha=True,
                  rwhi_gate_init=0.2,
                  rwhi_gate_const=0.7,
+                 loss_alpha_anchor_weight=0.2,
                  rwhi_cfg=None,
                  polar_radius=None,
                  **kwargs):
@@ -53,6 +55,7 @@ class RaCFormer_head(DETRHead):
         self.use_alpha = use_alpha
         self.rwhi_gate_init = rwhi_gate_init
         self._rwhi_gate_const_value = rwhi_gate_const
+        self.loss_alpha_anchor_weight = loss_alpha_anchor_weight
         self.rwhi_cfg = rwhi_cfg if rwhi_cfg is not None else {}
         self.rwhi_cfg.setdefault('use_alpha', self.use_alpha)
         
@@ -257,9 +260,7 @@ class RaCFormer_head(DETRHead):
         
         如果使用动态 RWHI：
         1. pos2content(query_bbox[..., :3]) → 动态内容
-        2. alpha_emb = encode_alpha(alpha_values)
-        3. 融合: cat([content, alpha_emb]) → alpha_fusion
-        4. 添加 indicator
+        2. 添加 indicator
         
         否则使用原始方式。
         
@@ -289,21 +290,14 @@ class RaCFormer_head(DETRHead):
             label_enc_base = self.label_enc.weight[self.num_classes].repeat(self.num_query, 1)
             label_enc_base = label_enc_base.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, K, embed_dims-1]
             
-            # ✅ AMP dtype fix: Cast label_enc_base to match fused_content dtype
-            # label_enc.weight stays fp32, but fused_content may be fp16 under AMP
+            # ✅ AMP dtype fix: Cast label_enc_base to match dynamic_content dtype
+            # label_enc.weight stays fp32, but dynamic_content may be fp16 under AMP
             label_enc_base = label_enc_base.to(dtype=dynamic_content.dtype)
-
-            if self.use_alpha:
-                # α embedding 融合
-                alpha_emb = self.rwhi_module.encode_alpha(alpha_values)  # [B, K, d_alpha]
-                feat_with_alpha = torch.cat([dynamic_content, alpha_emb], dim=-1)
-                fused_content = self.alpha_fusion(feat_with_alpha)  # [B, K, embed_dims-1]
-                query_feat_content = label_enc_base + self.rwhi_gate * fused_content
-            else:
-                gate = self.rwhi_gate_const
-                if isinstance(gate, torch.Tensor):
-                    gate = gate.to(dtype=dynamic_content.dtype)
-                query_feat_content = label_enc_base + gate * dynamic_content
+            
+            gate = self.rwhi_gate if self.use_alpha else self.rwhi_gate_const
+            if isinstance(gate, torch.Tensor):
+                gate = gate.to(dtype=dynamic_content.dtype)
+            query_feat_content = label_enc_base + gate * dynamic_content
             
             # 添加 indicator
             indicator = indicator0.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, K, 1]
@@ -413,6 +407,7 @@ class RaCFormer_head(DETRHead):
                 'enc_cls_scores': None,
                 'enc_bbox_preds': None, 
                 'dn_mask_dict': mask_dict,
+                'alpha_values': alpha_values,
             }
         else:
             outs = {
@@ -420,6 +415,7 @@ class RaCFormer_head(DETRHead):
                 'all_bbox_preds': bbox_preds,
                 'enc_cls_scores': None,
                 'enc_bbox_preds': None, 
+                'alpha_values': alpha_values,
             }
 
         return outs
@@ -429,7 +425,7 @@ class RaCFormer_head(DETRHead):
         准备 Query Denoising 输入
         
         【关键修复】接收外部传入的 init_query_feat，而不是内部重建
-        这样 RWHI 的 alpha embedding 和 pos2content 特征增强才能传递到 transformer
+        这样 RWHI 的 pos2content 特征增强才能传递到 transformer
         
         Args:
             batch_size: batch 大小
@@ -736,6 +732,56 @@ class RaCFormer_head(DETRHead):
         
         return loss_cls, loss_bbox
 
+    def _loss_alpha_anchor(self,
+                           cls_scores,
+                           bbox_preds,
+                           alpha_values,
+                           gt_bboxes_list,
+                           gt_labels_list,
+                           gt_bboxes_ignore=None):
+        """仅基于最后一层 decoder 的 Hungarian 匹配计算锚点级 α 损失"""
+        num_imgs = cls_scores.size(0)
+        alpha_values = alpha_values.squeeze(-1)
+
+        loss_sum = alpha_values.new_tensor(0.0)
+        num_total = 0
+
+        for i in range(num_imgs):
+            _, _, _, _, pos_inds, neg_inds = self._get_target_single(
+                cls_scores[i],
+                bbox_preds[i],
+                gt_labels_list[i],
+                gt_bboxes_list[i],
+                gt_bboxes_ignore,
+            )
+            num_pos = pos_inds.numel()
+            num_neg = neg_inds.numel()
+            if num_pos + num_neg == 0:
+                continue
+
+            alpha_img = alpha_values[i]
+            alpha_pos = alpha_img[pos_inds] if num_pos > 0 else alpha_img.new_empty(0)
+            alpha_neg = alpha_img[neg_inds] if num_neg > 0 else alpha_img.new_empty(0)
+            label_pos = alpha_pos.new_ones(alpha_pos.shape)
+            label_neg = alpha_neg.new_zeros(alpha_neg.shape)
+
+            if num_pos > 0 and num_neg > 0:
+                alpha_sel = torch.cat([alpha_pos, alpha_neg], dim=0)
+                label_sel = torch.cat([label_pos, label_neg], dim=0)
+            else:
+                alpha_sel = alpha_pos if num_pos > 0 else alpha_neg
+                label_sel = label_pos if num_pos > 0 else label_neg
+
+            loss_sum = loss_sum + F.binary_cross_entropy(alpha_sel, label_sel, reduction='sum')
+            num_total += num_pos + num_neg
+
+        if num_total == 0:
+            return loss_sum
+
+        avg_factor = reduce_mean(alpha_values.new_tensor([num_total]))
+        avg_factor = torch.clamp(avg_factor, min=1.0)
+        return loss_sum / avg_factor
+
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self,
              gt_bboxes_list,
@@ -792,6 +838,19 @@ class RaCFormer_head(DETRHead):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             num_dec_layer += 1
+
+        if self.training and self.use_alpha:
+            alpha_values = preds_dicts.get('alpha_values', None)
+            if alpha_values is not None:
+                loss_alpha_anchor = self._loss_alpha_anchor(
+                    all_cls_scores[-1],
+                    all_bbox_preds[-1],
+                    alpha_values,
+                    gt_bboxes_list,
+                    gt_labels_list,
+                    gt_bboxes_ignore,
+                )
+                loss_dict['loss_alpha_anchor'] = loss_alpha_anchor * self.loss_alpha_anchor_weight
         return loss_dict
 
     @force_fp32(apply_to=('preds_dicts'))

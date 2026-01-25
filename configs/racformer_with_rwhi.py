@@ -45,13 +45,14 @@ bev_depth_num = 5
 d_region_list = [0.08, 0.07, 0.06, 0.05, 0.04, 0.03]
 
 num_clusters = 6
-num_ray = 1200 // num_clusters
-num_query = 1200
+num_ray = 900 // num_clusters
+num_query = 900
 num_rwhi = 600
-use_alpha = False
+use_alpha = True
 alpha_const = 0.7
 rwhi_gate_init = 0.2
 rwhi_gate_const = 0.7
+loss_alpha_anchor_weight = 0.2
 
 # ============ RWHI v7 关键配置 ============
 # 全链路统一的极坐标半径 - 必须在所有地方保持一致
@@ -222,6 +223,7 @@ model = dict(
         use_alpha=use_alpha,              # 是否启用 α 学习与特征融合
         rwhi_gate_init=rwhi_gate_init,    # use_alpha=True 时的可学习门控初值
         rwhi_gate_const=rwhi_gate_const,  # use_alpha=False 时的固定门控
+        loss_alpha_anchor_weight=loss_alpha_anchor_weight,
         rwhi_cfg=rwhi_cfg,                # RWHI 配置
         polar_radius=R_MAX,               # 全链路统一 polar_radius
         # ============ RWHI v7 配置结束 ============
@@ -390,7 +392,8 @@ total_epochs = 20
 batch_size = 4
 
 # load pretrained weights
-load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
+#load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
+load_from = 'pretrain/rwhi-v7-e2.pth'
 revise_keys = [('backbone', 'img_backbone')]
 
 # resume the last training

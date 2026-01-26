@@ -35,6 +35,7 @@ class RaCFormer_head(DETRHead):
                  use_alpha=True,
                  rwhi_gate_init=0.2,
                  rwhi_gate_const=0.7,
+                 rwhi_affect_query=True,
                  loss_alpha_anchor_weight=0.2,
                  rwhi_cfg=None,
                  polar_radius=None,
@@ -53,6 +54,7 @@ class RaCFormer_head(DETRHead):
         # RWHI 相关
         self.use_rwhi = use_rwhi
         self.use_alpha = use_alpha
+        self.rwhi_affect_query = rwhi_affect_query
         self.rwhi_gate_init = rwhi_gate_init
         self._rwhi_gate_const_value = rwhi_gate_const
         self.loss_alpha_anchor_weight = loss_alpha_anchor_weight
@@ -278,7 +280,8 @@ class RaCFormer_head(DETRHead):
         dtype = query_bbox.dtype
         indicator0 = torch.zeros([self.num_query, 1], device=device, dtype=dtype)
         
-        if using_dynamic_rwhi:
+        # 当 rwhi_affect_query=False 时，RWHI 只影响锚点分布，不再注入 query 内容
+        if using_dynamic_rwhi and self.use_rwhi and self.rwhi_affect_query:
             # 动态 query_feat
             query_pos = query_bbox[..., :3]  # [B, K, 3] (θ, d, z)
             

@@ -53,6 +53,8 @@ alpha_const = 0.7
 rwhi_gate_init = 0.2
 rwhi_gate_const = 0.7
 loss_alpha_anchor_weight = 0.2
+# 控制 RWHI 是否影响 query 特征（默认 True，保持旧行为）
+rwhi_affect_query = False
 
 # ============ RWHI v7 关键配置 ============
 # 全链路统一的极坐标半径 - 必须在所有地方保持一致
@@ -223,6 +225,7 @@ model = dict(
         use_alpha=use_alpha,              # 是否启用 α 学习与特征融合
         rwhi_gate_init=rwhi_gate_init,    # use_alpha=True 时的可学习门控初值
         rwhi_gate_const=rwhi_gate_const,  # use_alpha=False 时的固定门控
+        rwhi_affect_query=rwhi_affect_query,  # 从 config 控制是否启用
         loss_alpha_anchor_weight=loss_alpha_anchor_weight,
         rwhi_cfg=rwhi_cfg,                # RWHI 配置
         polar_radius=R_MAX,               # 全链路统一 polar_radius
@@ -363,12 +366,12 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=4e-4,
+    lr=1e-4,
     paramwise_cfg=dict(custom_keys={
         'img_backbone': dict(lr_mult=0.1),
         'sampling_offset': dict(lr_mult=0.1),
         # RWHI 模块可以使用较小的学习率
-        'rwhi_module': dict(lr_mult=0.5),
+        'rwhi_module': dict(lr_mult=1.1),
     }),
     weight_decay=0.01
 )

@@ -1,0 +1,73 @@
+# --- Windows 系统文件 ---
+.cursor/
+.idea/
+outputs/
+__pycache__/
+
+*.tmp
+*.temp
+*.pdf
+*.txt
+
+# 忽略所有 NTFS 数据流文件
+*:Zone.Identifier
+# 其他 Windows 文件
+Thumbs.db
+Desktop.ini
+
+# --- IDE 和编辑器文件 ---
+# 您项目中的特定文件
+*.srctrlbm
+*.srctrldb
+*.srctrlprj
+# 通用编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- 操作系统生成文件 ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# --- Python 相关 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.env
+venv/
+ENV/
+
+# --- 训练生成文件 ---
+checkpoints/
+logs/
+*.pth
+*.onnx
+*.torch
+
+# --- 数据文件（通常较大） ---
+data/
+*.zip
+*.tar.gz
+*.h5
+*.npy

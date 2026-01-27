@@ -1,0 +1,65 @@
+1、数据集经验：
+在racformer目录创建data/nuscenes/数据的结构，其中nuscens是快捷链接
+如下例子
+# 删除当前错误的符号链接
+cd ~/derma/RaCFormer/data
+rm -f nuscenes
+
+# 创建正确的符号链接（直接指向数据集根目录）
+ln -s /data/dataset/RacFormer/nuscenes .  # 注意最后那个点！
+
+# 验证新结构
+ls -l 
+# 应该显示：nuscenes -> /data/dataset/RacFormer/nuscenes
+# 而不是之前显示的 nuscenes/nuscenes
+
+2、测试、训练指令
+
+Ealuation
+Single-GPU evaluation:
+『
+export CUDA_VISIBLE_DEVICES=0
+python val.py --config configs/racformer_r50_nuimg_704x256_f8.py --weights racformer_r50_f8.pth
+』
+Multi-GPU evaluation:
+『
+export CUDA_VISIBLE_DEVICES=0,1
+torchrun --nproc_per_node 2 val.py --config configs/racformer_r50_nuimg_704x256_f8.py --weights racformer_r50_f8.pth 
+』
+
+training
+torchrun --nproc_per_node 2 train.py --config configs/racformer_r50_nuimg_704x256_f8.py
+
+3、用nuscenes官方的脚本来分析跑出来的结果
+
+python -m nuscenes.eval.detection.evaluate \
+    ./submission/pts_bbox/results_nusc.json \
+    --output_dir ./eval_results/result2 \
+    --eval_set val \
+    --dataroot /data/dataset/RacFormer/nuscenes \
+    --version v1.0-trainval
+下面是注释，运行的时候后面的注释不能要
+python -m nuscenes.eval.detection.evaluate \
+    ./submission/pts_bbox/results_nusc.json \  # 模型预测结果文件
+    --output_dir ./eval_results \              # 评估结果输出目录
+    --eval_set val \                           # 使用验证集评估
+    --dataroot /data/dataset/RacFormer/nuscenes \ # 数据集根路径
+    --version v1.0-trainval                   # 数据集版本    
+    
+4、清理gpu进程
+
+查看gpu进程
+fuser -v /dev/nvidia*
+
+    # 提取所有占用GPU的Python进程PID
+fuser /dev/nvidia* 2>/dev/null | grep -oP '\d+' | sort -u | xargs kill -9
+
+5、实时查看gpu
+
+watch -n 1 nvidia-smi
+
+6、中断训练后恢复
+
+torchrun --nproc_per_node 2 train.py \
+    --config configs/racformer_r50_nuimg_704x256_f8.py \
+    --resume_from "outputs/racformer_r50_nuimg_704x256_f8/2025-07-16/18-06-23/latest.pth"

@@ -35,3 +35,6 @@ ClampBackward 版本冲突（_validate_query_bbox 就地 clamp）	改为 out-of-
 GGF 单测导入失败（bev_pool_v2_ext 缺失）	在 models/__init__.py 中对 necks 导入做 try/except，避免非必要 CUDA 扩展导致 GGF 单测中断。
 NativeRGF 报错：'float' object has no attribute 'clamp'	use_velocity_anisotropy 分支中 sigma_y 保持 tensor（sigma_tangent = sigma_y），避免 float 覆盖。
 冒烟训练失败：data/nuscenes/v1.0-trainval 不存在	补齐 nuScenes 数据集或修正 dataroot 后再跑训练。
+Cholesky 分解失败（Sigma_uv 非正定）	Sigma_uv 由 MGC 投影得到，训练早期可能非 SPD；已通过对称化 + 特征值 clamp + SPD 投影 + fallback（对角缩放）解决；若新数据集仍报错可调 eps / max_val。
+MGC debug 日志缺失（debug_mgc=True 仍无输出）	检查 GGF cached params 是否生成；确认 use_image_sampling=True；必要时将 MGC debug 改为 logging 或 tee stdout 保存。
+DataLoader worker 启动报错：cannot pickle 'dict_keys' object	将 dataset.eval_detection_configs.class_names 从 dict_keys 转为 list（在 CustomNuScenesDataset __init__ 里 list(...)）。

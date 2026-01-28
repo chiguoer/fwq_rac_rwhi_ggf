@@ -10,10 +10,12 @@ GGF2.0 (Geometry-Guided Fusion) 模块
 """
 
 import math
+import time
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.runner import BaseModule
+from mmcv.runner import BaseModule, get_dist_info
 
 from .bbox.utils import R_MAX, theta_d2xy_coods, xy2theta_d_coods
 
@@ -54,6 +56,14 @@ class NativeRGF(nn.Module):
         sigma_max=10.0,  # 最大标准差 (m)
         amplitude_mode='rcs',  # 振幅模式: 'rcs', 'uniform', 'learned'
         rcs_scale=0.1,  # RCS 到振幅的缩放系数
+        kernel_size=7,  # 局部散射核尺寸 (奇数)
+        predict_params=True,  # 是否预测高斯参数 (sx, sy, theta)
+        input_indices=None,  # 雷达点特征索引
+        hidden_dims=64,  # MLP 隐藏层维度
+        use_rotation=True,  # 是否使用旋转高斯
+        theta_scale=math.pi,  # 角度输出缩放
+        profile_rgf=False,  # 是否输出简单耗时统计
+        profile_rgf_every=100,  # profiler 输出间隔
         chunk_size=128,  # 分块大小：控制显存占用
         init_cfg=None,
     ):
@@ -72,10 +82,36 @@ class NativeRGF(nn.Module):
         self.sigma_max = sigma_max
         self.amplitude_mode = amplitude_mode
         self.rcs_scale = rcs_scale
+        self.kernel_size = kernel_size
+        self.predict_params = predict_params
+        self.input_indices = input_indices
+        self.hidden_dims = hidden_dims
+        self.use_rotation = use_rotation
+        self.theta_scale = theta_scale
+        self.profile_rgf = profile_rgf
+        self.profile_rgf_every = profile_rgf_every
+        self._rgf_step = 0
         self.chunk_size = chunk_size
-        
+
         # 预计算 BEV 网格坐标
         self._init_grid()
+
+        # 预计算局部散射网格
+        self._init_local_grid()
+
+        # 参数预测器
+        if self.predict_params:
+            in_dim = len(input_indices) if input_indices is not None else 5
+            hidden = hidden_dims
+            self.param_predictor = nn.Sequential(
+                nn.Linear(in_dim, hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden, hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden, 3),
+            )
+        else:
+            self.param_predictor = None
     
     def _init_grid(self):
         """初始化 BEV 网格坐标"""
@@ -99,6 +135,18 @@ class NativeRGF(nn.Module):
         grid_xy = torch.stack([xx, yy], dim=-1)  # [H, W, 2]
         
         self.register_buffer('grid_xy', grid_xy)
+
+    def _init_local_grid(self):
+        """初始化局部散射网格 (KxK)"""
+        k = max(int(self.kernel_size), 1)
+        if k % 2 == 0:
+            k = k + 1
+        self.kernel_size = k
+        radius = k // 2
+        offset_range = torch.arange(-radius, radius + 1)
+        oy, ox = torch.meshgrid(offset_range, offset_range, indexing='ij')
+        offsets = torch.stack([ox, oy], dim=-1).view(-1, 2)  # [K*K, 2]
+        self.register_buffer('local_offsets', offsets)
     
     def _compute_gaussian_params(self, radar_points, radar_mask):
         """
@@ -113,6 +161,8 @@ class NativeRGF(nn.Module):
             sigmas: [B, M, 2] 标准差 (sigma_x, sigma_y)
             amplitudes: [B, M] 振幅
             mask_bool: [B, M] 有效点布尔掩码或 None
+            theta: [B, M] 旋转角
+            precision: [B, M, 2, 2] 精度矩阵 (Sigma^-1)
         """
         B, M, C = radar_points.shape
         device = radar_points.device
@@ -121,35 +171,51 @@ class NativeRGF(nn.Module):
         # 高斯中心
         centers = radar_points[..., :2]  # [B, M, 2]
         
-        # 计算标准差
+        # 计算标准差与旋转角
         sigma_x = torch.full((B, M), self.default_sigma_x, device=device, dtype=dtype)
         sigma_y = torch.full((B, M), self.default_sigma_y, device=device, dtype=dtype)
-        
-        if self.use_velocity_anisotropy and C > 4:
-            # 根据速度方向调整各向异性
-            v_r = radar_points[..., 4]  # 径向速度
-            
-            # 速度越大，沿运动方向的不确定性越大
-            v_factor = 1.0 + self.velocity_scale * v_r.abs()
-            
-            # 计算雷达点相对于原点的方向
-            x, y = radar_points[..., 0], radar_points[..., 1]
-            dist = torch.sqrt(x ** 2 + y ** 2).clamp(min=EPS)
-            dir_x, dir_y = x / dist, y / dist
-            
-            # 径向速度影响径向方向的不确定性
-            sigma_radial = self.default_sigma_x * v_factor
-            # 使用已有 tensor 作为切向 sigma，避免 float -> tensor 的类型混乱
-            sigma_tangent = sigma_y
+        theta = torch.zeros((B, M), device=device, dtype=dtype)
 
-            # 简化：直接使用径向/切向作为 x/y 方向
-            sigma_x = sigma_radial
-            sigma_y = sigma_tangent
+        if self.predict_params and self.param_predictor is not None:
+            if self.input_indices is not None:
+                feat = radar_points[..., self.input_indices]
+            else:
+                feat = radar_points
+            in_dim = self.param_predictor[0].in_features
+            if feat.shape[-1] < in_dim:
+                pad = in_dim - feat.shape[-1]
+                feat = torch.cat([feat, torch.zeros(B, M, pad, device=device, dtype=dtype)], dim=-1)
+            else:
+                feat = feat[..., :in_dim]
+            pred = self.param_predictor(feat)
+            sigma_pred = F.softplus(pred[..., :2]) + 1e-2
+            theta = torch.tanh(pred[..., 2]) * self.theta_scale
+            sigma_x = sigma_pred[..., 0]
+            sigma_y = sigma_pred[..., 1]
+        else:
+            if self.use_velocity_anisotropy and C > 4:
+                # 根据速度方向调整各向异性
+                v_r = radar_points[..., 4]  # 径向速度
+
+                # 速度越大，沿运动方向的不确定性越大
+                v_factor = 1.0 + self.velocity_scale * v_r.abs()
+
+                # 径向速度影响径向方向的不确定性
+                sigma_radial = self.default_sigma_x * v_factor
+                # 使用已有 tensor 作为切向 sigma，避免 float -> tensor 的类型混乱
+                sigma_tangent = sigma_y
+
+                # 简化：直接使用径向/切向作为 x/y 方向
+                sigma_x = sigma_radial
+                sigma_y = sigma_tangent
         
         # Clamp 标准差
         sigma_x = sigma_x.clamp(min=self.sigma_min, max=self.sigma_max)
         sigma_y = sigma_y.clamp(min=self.sigma_min, max=self.sigma_max)
         sigmas = torch.stack([sigma_x, sigma_y], dim=-1)  # [B, M, 2]
+
+        # 计算精度矩阵
+        precision = self._build_precision(sigmas, theta)
         
         # 计算振幅
         if self.amplitude_mode == 'rcs' and C > 3:
@@ -173,9 +239,42 @@ class NativeRGF(nn.Module):
                 [self.default_sigma_x, self.default_sigma_y], device=device, dtype=dtype
             ).view(1, 1, 2).expand_as(sigmas)
             sigmas = torch.where(mask_bool.unsqueeze(-1), sigmas, fallback)
+            theta = torch.where(mask_bool, theta, torch.zeros_like(theta))
+            fallback_precision = self._build_precision(fallback, torch.zeros_like(theta))
+            precision = torch.where(
+                mask_bool.unsqueeze(-1).unsqueeze(-1),
+                precision,
+                fallback_precision
+            )
             amplitudes = torch.where(mask_bool, amplitudes, torch.zeros_like(amplitudes))
 
-        return centers, sigmas, amplitudes, mask_bool
+        return centers, sigmas, amplitudes, mask_bool, theta, precision
+
+    def _build_precision(self, sigmas, theta):
+        """
+        构建 2x2 精度矩阵 (Sigma^-1)
+        """
+        inv_s2 = 1.0 / (sigmas ** 2 + EPS)  # [B, M, 2]
+        if not self.use_rotation:
+            precision = torch.zeros(sigmas.shape[0], sigmas.shape[1], 2, 2, device=sigmas.device, dtype=sigmas.dtype)
+            precision[..., 0, 0] = inv_s2[..., 0]
+            precision[..., 1, 1] = inv_s2[..., 1]
+            return precision
+
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+        # 旋转矩阵 R
+        r11 = cos_t
+        r12 = -sin_t
+        r21 = sin_t
+        r22 = cos_t
+        # 计算 R * diag(inv_s2) * R^T
+        precision = torch.zeros(sigmas.shape[0], sigmas.shape[1], 2, 2, device=sigmas.device, dtype=sigmas.dtype)
+        precision[..., 0, 0] = r11 * r11 * inv_s2[..., 0] + r12 * r12 * inv_s2[..., 1]
+        precision[..., 1, 1] = r21 * r21 * inv_s2[..., 0] + r22 * r22 * inv_s2[..., 1]
+        precision[..., 0, 1] = r11 * r21 * inv_s2[..., 0] + r12 * r22 * inv_s2[..., 1]
+        precision[..., 1, 0] = precision[..., 0, 1]
+        return precision
     
     def forward(self, radar_points, radar_mask, return_params=False):
         """
@@ -195,45 +294,84 @@ class NativeRGF(nn.Module):
         device = radar_points.device
         dtype = radar_points.dtype
         
+        t_start = time.perf_counter() if self.profile_rgf else None
+
         # 计算高斯参数
-        centers, sigmas, amplitudes, mask_bool = self._compute_gaussian_params(radar_points, radar_mask)
-        
-        # 获取网格坐标 [H, W, 2]
-        grid_xy = self.grid_xy.to(device=device, dtype=dtype)
-        
-        # 初始化高斯场（分块向量化，降低显存占用）
-        field = torch.zeros(B, H, W, device=device, dtype=dtype)
-        grid_expanded = grid_xy.unsqueeze(0).unsqueeze(3)  # [1, H, W, 1, 2]
-        
+        centers, sigmas, amplitudes, mask_bool, theta, precision = self._compute_gaussian_params(radar_points, radar_mask)
+
+        # 初始化高斯场（局部散射）
+        field = torch.zeros(B, H * W, device=device, dtype=dtype)
+
         if radar_mask is not None:
             amplitudes = amplitudes * radar_mask.to(dtype)
-        
+
+        # 预计算局部偏移
+        offsets = self.local_offsets.to(device=device)  # [K*K, 2]
+        offsets_x = offsets[:, 0].view(1, 1, -1)
+        offsets_y = offsets[:, 1].view(1, 1, -1)
+
+        x_min, y_min = self.pc_range[0], self.pc_range[1]
+        res = self.grid_resolution
+
         chunk_size = self.chunk_size if self.chunk_size and self.chunk_size > 0 else M
         for start in range(0, M, chunk_size):
             end = min(M, start + chunk_size)
             if radar_mask is not None and not radar_mask[:, start:end].any():
                 continue
-            
+
             centers_chunk = centers[:, start:end]  # [B, mc, 2]
-            sigmas_chunk = sigmas[:, start:end]    # [B, mc, 2]
             amps_chunk = amplitudes[:, start:end]  # [B, mc]
-            
-            centers_expanded = centers_chunk.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, mc, 2]
-            sigmas_expanded = sigmas_chunk.unsqueeze(1).unsqueeze(1)    # [B, 1, 1, mc, 2]
-            amps_expanded = amps_chunk.unsqueeze(1).unsqueeze(1)        # [B, 1, 1, mc]
-            
-            diff = grid_expanded - centers_expanded  # [B, H, W, mc, 2]
-            inv_var = 1.0 / (sigmas_expanded ** 2 + EPS)  # [B, 1, 1, mc, 2]
-            mahal_sq = (diff ** 2 * inv_var).sum(dim=-1)  # [B, H, W, mc]
-            gaussian = amps_expanded * torch.exp(-0.5 * mahal_sq)  # [B, H, W, mc]
-            field = field + gaussian.sum(dim=-1)  # [B, H, W]
-        
-        gaussian_field = field.unsqueeze(1)
+            precision_chunk = precision[:, start:end]  # [B, mc, 2, 2]
+
+            # 计算网格索引
+            grid_x = ((centers_chunk[..., 0] - x_min) / res).long()
+            grid_y = ((centers_chunk[..., 1] - y_min) / res).long()
+
+            # 局部邻域索引
+            nx = grid_x.unsqueeze(-1) + offsets_x  # [B, mc, K2]
+            ny = grid_y.unsqueeze(-1) + offsets_y  # [B, mc, K2]
+
+            valid = (nx >= 0) & (nx < W) & (ny >= 0) & (ny < H)
+
+            # 物理坐标
+            x_phys = x_min + (nx.to(dtype) + 0.5) * res
+            y_phys = y_min + (ny.to(dtype) + 0.5) * res
+
+            dx = x_phys - centers_chunk[..., 0].unsqueeze(-1)
+            dy = y_phys - centers_chunk[..., 1].unsqueeze(-1)
+            diff = torch.stack([dx, dy], dim=-1)  # [B, mc, K2, 2]
+
+            # 马氏距离
+            diff_vec = diff.unsqueeze(-1)  # [B, mc, K2, 2, 1]
+            prec = precision_chunk.unsqueeze(2)  # [B, mc, 1, 2, 2]
+            term = torch.matmul(prec, diff_vec)
+            mahal_sq = torch.matmul(diff_vec.transpose(-1, -2), term).squeeze(-1).squeeze(-1)  # [B, mc, K2]
+
+            gaussian = amps_chunk.unsqueeze(-1) * torch.exp(-0.5 * mahal_sq)  # [B, mc, K2]
+            gaussian = gaussian * valid.to(dtype)
+
+            linear_idx = (ny * W + nx).long()  # [B, mc, K2]
+            for b in range(B):
+                valid_b = valid[b]
+                if not valid_b.any():
+                    continue
+                idx = linear_idx[b][valid_b]
+                val = gaussian[b][valid_b]
+                field[b].scatter_add_(0, idx.view(-1), val.view(-1))
+
+        gaussian_field = field.view(B, H, W).unsqueeze(1)
+
+        self._rgf_step += 1
+        if self.profile_rgf and (self._rgf_step % self.profile_rgf_every == 0) and t_start is not None:
+            elapsed = (time.perf_counter() - t_start) * 1000.0
+            print(f"[NativeRGF] forward time={elapsed:.2f} ms (B={B}, M={M}, K={self.kernel_size})")
         
         if return_params:
             params = {
                 'centers': centers,
                 'sigmas': sigmas,
+                'theta': theta,
+                'precision': precision,
                 'amplitudes': amplitudes,
             }
             if mask_bool is not None:
@@ -267,6 +405,14 @@ class GeometryFieldBuilder(nn.Module):
         rgf_sigma_y=3.0,
         rgf_use_velocity=True,
         rgf_velocity_scale=0.1,
+        rgf_kernel_size=7,
+        rgf_predict_params=True,
+        rgf_input_indices=None,
+        rgf_hidden_dims=64,
+        rgf_use_rotation=True,
+        rgf_theta_scale=math.pi,
+        rgf_profile=False,
+        rgf_profile_every=100,
         # 场缩放参数
         linear_scale=1.0,  # 线性场缩放
         linear_bias=1.0,   # 线性场基础偏置（对应背景分数）
@@ -300,6 +446,14 @@ class GeometryFieldBuilder(nn.Module):
                 default_sigma_y=rgf_sigma_y,
                 use_velocity_anisotropy=rgf_use_velocity,
                 velocity_scale=rgf_velocity_scale,
+                kernel_size=rgf_kernel_size,
+                predict_params=rgf_predict_params,
+                input_indices=rgf_input_indices,
+                hidden_dims=rgf_hidden_dims,
+                use_rotation=rgf_use_rotation,
+                theta_scale=rgf_theta_scale,
+                profile_rgf=rgf_profile,
+                profile_rgf_every=rgf_profile_every,
             )
         else:
             self.native_rgf = None
@@ -382,6 +536,13 @@ class MGCModule(nn.Module):
     
     输出：
     - 采样 offset 调整或采样网格
+
+    位置：
+    - 位于解码器图像采样分支，用雷达高斯椭圆约束图像采样，再与雷达/LSS BEV 融合
+
+    已知问题（修复点）：
+    - sigma_uv 在训练早期可能非正定，导致 torch.linalg.cholesky 报错
+      “input is not positive-definite”
     """
     
     def __init__(
@@ -395,6 +556,20 @@ class MGCModule(nn.Module):
         # 椭圆投影参数
         ellipse_scale=2.0,  # 椭圆半径倍数（相对于 sigma）
         project_to_image=True,
+        use_image_sampling=False,  # 是否启用图像分支采样
+        sample_res=None,  # 图像采样分辨率 (h, w) 或 int
+        view_select='first_valid',  # 视角选择策略
+        min_depth=1e-5,  # 最小投影深度
+        align_corners=True,
+        spd_eig_min=1e-4,  # SPD 特征值下界
+        spd_eig_max=None,  # SPD 特征值上界（None 表示不设）
+        fallback_scale=1e-2,  # Cholesky 失败或无效时回退尺度
+        max_dist=None,  # 超过该距离（m）不启用 MGC
+        debug_mgc=False,  # 是否打印/统计调试信息
+        debug_mgc_every=100,  # 调试输出间隔
+        debug_mgc_max_print=5,  # 最大打印次数
+        profile_mgc=False,  # 是否输出简单耗时统计
+        profile_mgc_every=100,  # profiler 输出间隔
         # 学习参数
         learnable_strength=True,
         init_cfg=None,
@@ -409,6 +584,33 @@ class MGCModule(nn.Module):
         self.constraint_strength = constraint_strength
         self.ellipse_scale = ellipse_scale
         self.project_to_image = project_to_image
+        self.use_image_sampling = use_image_sampling
+        if sample_res is None:
+            self.sample_res = None
+        elif isinstance(sample_res, int):
+            self.sample_res = (sample_res, sample_res)
+        else:
+            self.sample_res = tuple(sample_res)
+        self.view_select = view_select
+        self.min_depth = min_depth
+        self.align_corners = align_corners
+        self.spd_eig_min = spd_eig_min
+        self.spd_eig_max = spd_eig_max
+        self.fallback_scale = fallback_scale
+        self.max_dist = max_dist
+        self.debug_mgc = debug_mgc
+        self.debug_mgc_every = debug_mgc_every
+        self.debug_mgc_max_print = debug_mgc_max_print
+        self.profile_mgc = profile_mgc
+        self.profile_mgc_every = profile_mgc_every
+        self._mgc_debug_step = 0
+        self._mgc_debug_prints = 0
+        self.logger = logging.getLogger()
+        try:
+            rank, _ = get_dist_info()
+        except Exception:
+            rank = 0
+        self._is_main_process = (rank == 0)
         
         if learnable_strength:
             self.strength_param = nn.Parameter(torch.tensor(constraint_strength))
@@ -537,6 +739,288 @@ class MGCModule(nn.Module):
         adjusted_d_region = adjusted_d_region.clamp(min=d_region * 0.3, max=d_region)
         
         return strength, adjusted_d_region
+
+    def _safe_spd_cholesky(self, sigma_uv, valid_mask=None):
+        """
+        将 sigma_uv 投影到 SPD 并做 Cholesky 分解。
+        Args:
+            sigma_uv: [..., 2, 2]
+            valid_mask: [...], True 表示有效
+        Returns:
+            sigma_spd: [..., 2, 2]
+            L: [..., 2, 2]
+            stats: dict (可选)
+            fallback_mask: [...] True 表示回退
+        """
+        dtype = sigma_uv.dtype
+        device = sigma_uv.device
+
+        # 若全无有效点，直接返回退化尺度
+        if valid_mask is not None and not valid_mask.any():
+            fallback_L = torch.zeros_like(sigma_uv)
+            fallback_L[..., 0, 0] = self.fallback_scale
+            fallback_L[..., 1, 1] = self.fallback_scale
+            fallback_sigma = fallback_L @ fallback_L.transpose(-1, -2)
+            stats = None
+            if self.debug_mgc:
+                stats = {
+                    'eig_min': self.fallback_scale ** 2,
+                    'eig_mean': self.fallback_scale ** 2,
+                    'eig_max': self.fallback_scale ** 2,
+                    'fallback_ratio': 1.0,
+                }
+            return fallback_sigma, fallback_L, stats, torch.ones_like(valid_mask, dtype=torch.bool)
+
+        # 对称化
+        sigma_sym = 0.5 * (sigma_uv + sigma_uv.transpose(-1, -2))
+
+        eye = torch.eye(2, device=device, dtype=dtype).view(*([1] * (sigma_sym.dim() - 2)), 2, 2)
+        if valid_mask is not None:
+            sigma_sym = torch.where(
+                valid_mask.unsqueeze(-1).unsqueeze(-1),
+                sigma_sym,
+                eye * (self.fallback_scale ** 2)
+            )
+
+        sigma_sym_f = sigma_sym.float() if sigma_sym.dtype in (torch.float16, torch.bfloat16) else sigma_sym
+        eigvals, eigvecs = torch.linalg.eigh(sigma_sym_f)
+
+        eigvals_clamped = eigvals.clamp(min=self.spd_eig_min)
+        if self.spd_eig_max is not None:
+            eigvals_clamped = eigvals_clamped.clamp(max=self.spd_eig_max)
+
+        sigma_spd_f = eigvecs @ torch.diag_embed(eigvals_clamped) @ eigvecs.transpose(-1, -2)
+        sigma_spd = sigma_spd_f.to(dtype=dtype)
+
+        fallback_mask = torch.zeros_like(eigvals_clamped[..., 0], dtype=torch.bool)
+        try:
+            L_f = torch.linalg.cholesky(sigma_spd_f)
+            info = None
+        except RuntimeError as exc:
+            if self.debug_mgc and self._is_main_process and self._mgc_debug_prints < self.debug_mgc_max_print:
+                self.logger.warning('[MGC] cholesky failed, fallback to cholesky_ex: %s', exc)
+                self._mgc_debug_prints += 1
+            L_f, info = torch.linalg.cholesky_ex(sigma_spd_f, check_errors=False)
+
+        if info is not None:
+            fallback_mask = info > 0
+            if fallback_mask.any() and self.debug_mgc and self._is_main_process and self._mgc_debug_prints < self.debug_mgc_max_print:
+                self.logger.warning('[MGC] cholesky_ex fallback triggered for some elements.')
+                self._mgc_debug_prints += 1
+
+        if fallback_mask.any():
+            fallback_L = torch.zeros_like(L_f)
+            fallback_L[..., 0, 0] = self.fallback_scale
+            fallback_L[..., 1, 1] = self.fallback_scale
+            L_f = torch.where(fallback_mask.unsqueeze(-1).unsqueeze(-1), fallback_L, L_f)
+            sigma_spd = torch.where(
+                fallback_mask.unsqueeze(-1).unsqueeze(-1),
+                eye * (self.fallback_scale ** 2),
+                sigma_spd
+            )
+
+        L = L_f.to(dtype=dtype)
+
+        stats = None
+        if self.debug_mgc:
+            stats = {
+                'eig_min': eigvals_clamped.min().item(),
+                'eig_mean': eigvals_clamped.mean().item(),
+                'eig_max': eigvals_clamped.max().item(),
+                'fallback_ratio': fallback_mask.float().mean().item(),
+            }
+
+        return sigma_spd, L, stats, fallback_mask
+
+    def build_image_sampling_locations(self, query_bbox, query_feat, gaussian_params, img_metas, pc_range, sample_res=None):
+        """
+        基于雷达高斯椭圆构建图像采样位置 (affine_grid)
+
+        Returns:
+            sampling_locations: [B, Q, P, 3] in [0, 1] (x, y, view)
+            mgc_info: dict
+        """
+        if gaussian_params is None or 'centers' not in gaussian_params:
+            return None, {}
+
+        t_start = time.perf_counter() if self.profile_mgc else None
+
+        B, Q, _ = query_bbox.shape
+        device = query_bbox.device
+        dtype = query_bbox.dtype
+
+        lidar2img = img_metas[0]['lidar2img']  # [B, N, 4, 4]
+        image_h, image_w, _ = img_metas[0]['img_shape'][0]
+        N = lidar2img.shape[1]
+
+        # 采样分辨率
+        if sample_res is None:
+            if self.sample_res is None:
+                sample_h, sample_w = 3, 4
+            else:
+                sample_h, sample_w = self.sample_res
+        else:
+            if isinstance(sample_res, int):
+                sample_h, sample_w = sample_res, sample_res
+            else:
+                sample_h, sample_w = sample_res
+        P = sample_h * sample_w
+
+        # 预测每个 Query 的约束强度
+        strength = torch.sigmoid(self.strength_predictor(query_feat)).squeeze(-1)  # [B, Q]
+        strength = strength * self.strength_param
+
+        # 获取 Query 的物理坐标
+        query_bbox_xy = theta_d2xy_coods(query_bbox)
+        query_centers = query_bbox_xy[..., :2]
+        map_size = pc_range[3] - pc_range[0]
+        query_centers_phys = query_centers.clone()
+        query_centers_phys[..., 0] = query_centers[..., 0] * map_size + pc_range[0]
+        query_centers_phys[..., 1] = query_centers[..., 1] * map_size + pc_range[1]
+        query_z_phys = query_bbox[..., 2:3] * (pc_range[5] - pc_range[2]) + pc_range[2]
+
+        # 最近雷达高斯
+        radar_centers = gaussian_params['centers']  # [B, M, 2]
+        radar_sigmas = gaussian_params['sigmas']    # [B, M, 2]
+        radar_theta = gaussian_params.get('theta', None)
+        radar_mask = gaussian_params.get('mask', None)
+
+        dist_sq = ((query_centers_phys.unsqueeze(2) - radar_centers.unsqueeze(1)) ** 2).sum(dim=-1)
+        if radar_mask is not None:
+            dist_sq = dist_sq.masked_fill(~radar_mask.unsqueeze(1), float('inf'))
+
+        min_dist_sq, min_idx = dist_sq.min(dim=-1)  # [B, Q]
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, Q)
+        nearest_center = radar_centers[batch_idx, min_idx]  # [B, Q, 2]
+        nearest_sigma = radar_sigmas[batch_idx, min_idx].clamp(min=1e-3)  # [B, Q, 2]
+        if radar_theta is None:
+            nearest_theta = torch.zeros(B, Q, device=device, dtype=dtype)
+        else:
+            nearest_theta = radar_theta[batch_idx, min_idx]
+
+        # 椭圆轴向 (物理坐标)
+        cos_t = torch.cos(nearest_theta)
+        sin_t = torch.sin(nearest_theta)
+        ellipse_scale = self.ellipse_scale * (1.0 + 0.5 * strength)
+        axis1 = torch.stack([cos_t * nearest_sigma[..., 0] * ellipse_scale,
+                             sin_t * nearest_sigma[..., 0] * ellipse_scale], dim=-1)
+        axis2 = torch.stack([-sin_t * nearest_sigma[..., 1] * ellipse_scale,
+                             cos_t * nearest_sigma[..., 1] * ellipse_scale], dim=-1)
+
+        # 3D 点：中心与轴端点
+        center_xyz = torch.cat([nearest_center, query_z_phys], dim=-1)  # [B, Q, 3]
+        axis1_xyz = torch.cat([axis1, torch.zeros(B, Q, 1, device=device, dtype=dtype)], dim=-1)
+        axis2_xyz = torch.cat([axis2, torch.zeros(B, Q, 1, device=device, dtype=dtype)], dim=-1)
+        pts = torch.stack([center_xyz, center_xyz + axis1_xyz, center_xyz + axis2_xyz], dim=2)  # [B, Q, 3, 3]
+        pts_h = torch.cat([pts, torch.ones(B, Q, 3, 1, device=device, dtype=dtype)], dim=-1)  # [B, Q, 3, 4]
+
+        # 投影到各视角
+        pts_h = pts_h.unsqueeze(1).unsqueeze(-1)  # [B, 1, Q, 3, 4, 1]
+        lidar2img = lidar2img.unsqueeze(2).unsqueeze(3)  # [B, N, 1, 1, 4, 4]
+        proj = torch.matmul(lidar2img, pts_h).squeeze(-1)  # [B, N, Q, 3, 4]
+
+        u = proj[..., 0]
+        v = proj[..., 1]
+        depth = proj[..., 2].clamp(min=self.min_depth)
+        u = u / depth
+        v = v / depth
+
+        # 视角选择（基于中心点）
+        u_center = u[..., 0]
+        v_center = v[..., 0]
+        depth_center = depth[..., 0]
+        valid = (depth_center > self.min_depth) & (u_center > 0) & (u_center < image_w) & (v_center > 0) & (v_center < image_h)
+
+        view_idx = valid.float().argmax(dim=1)  # [B, Q]
+        valid_any = valid.any(dim=1)  # [B, Q]
+        if self.max_dist is not None:
+            valid_any = valid_any & (min_dist_sq <= (self.max_dist ** 2))
+
+        # 选择对应视角的投影结果
+        u_perm = u.permute(0, 2, 1, 3)  # [B, Q, N, 3]
+        v_perm = v.permute(0, 2, 1, 3)
+        gather_idx = view_idx.unsqueeze(-1).unsqueeze(-1).expand(B, Q, 1, 3)
+        u_sel = u_perm.gather(2, gather_idx).squeeze(2)  # [B, Q, 3]
+        v_sel = v_perm.gather(2, gather_idx).squeeze(2)  # [B, Q, 3]
+        u_sel = torch.nan_to_num(u_sel, nan=0.0, posinf=0.0, neginf=0.0)
+        v_sel = torch.nan_to_num(v_sel, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 计算仿射矩阵 (归一化到 [-1, 1])
+        u0 = u_sel[..., 0]
+        v0 = v_sel[..., 0]
+        u1 = u_sel[..., 1]
+        v1 = v_sel[..., 1]
+        u2 = u_sel[..., 2]
+        v2 = v_sel[..., 2]
+
+        center_u = u0 / image_w * 2 - 1
+        center_v = v0 / image_h * 2 - 1
+        axis1_u = (u1 - u0) / image_w * 2
+        axis1_v = (v1 - v0) / image_h * 2
+        axis2_u = (u2 - u0) / image_w * 2
+        axis2_v = (v2 - v0) / image_h * 2
+
+        # 无有效雷达支持的 query 直接置零，避免数值异常
+        valid_any_f = valid_any.to(dtype=dtype)
+        axis1_u = axis1_u * valid_any_f
+        axis1_v = axis1_v * valid_any_f
+        axis2_u = axis2_u * valid_any_f
+        axis2_v = axis2_v * valid_any_f
+
+        # 构建 Sigma_uv 并做 Cholesky 分解
+        A = torch.zeros(B, Q, 2, 2, device=device, dtype=dtype)
+        A[..., 0, 0] = axis1_u
+        A[..., 0, 1] = axis2_u
+        A[..., 1, 0] = axis1_v
+        A[..., 1, 1] = axis2_v
+        sigma_uv = torch.matmul(A, A.transpose(-1, -2))
+        sigma_uv, L, stats, fallback_mask = self._safe_spd_cholesky(sigma_uv, valid_mask=valid_any)
+
+        theta = torch.zeros(B, Q, 2, 3, device=device, dtype=dtype)
+        theta[..., 0:2, 0:2] = L
+        theta[..., 0, 2] = center_u
+        theta[..., 1, 2] = center_v
+
+        # 无有效视角时使用退化采样
+        fallback = torch.zeros_like(theta)
+        fallback[..., 0, 0] = 0.01
+        fallback[..., 1, 1] = 0.01
+        theta = torch.where(valid_any.unsqueeze(-1).unsqueeze(-1), theta, fallback)
+
+        # affine_grid 生成采样点
+        grid = F.affine_grid(theta.view(B * Q, 2, 3), torch.Size((B * Q, 1, sample_h, sample_w)),
+                             align_corners=self.align_corners)  # [-1, 1]
+        grid = grid.view(B, Q, sample_h * sample_w, 2)
+        grid = (grid + 1.0) * 0.5  # [0, 1]
+
+        # 视角索引归一化
+        view_coord = view_idx.to(dtype=dtype) / max(float(N - 1), 1.0)
+        view_coord = view_coord.view(B, Q, 1, 1).expand(B, Q, P, 1)
+        sampling_locations = torch.cat([grid, view_coord], dim=-1)  # [B, Q, P, 3]
+
+        self._mgc_debug_step += 1
+        if (self.debug_mgc and self._is_main_process and
+                (self._mgc_debug_step % self.debug_mgc_every == 0) and stats is not None):
+            axis_min = math.sqrt(stats['eig_min']) if stats['eig_min'] > 0 else 0.0
+            axis_max = math.sqrt(stats['eig_max']) if stats['eig_max'] > 0 else 0.0
+            self.logger.info(
+                "[MGC] eig(min/mean/max)=(%.4e, %.4e, %.4e) axis(min/max)=(%.4e, %.4e) "
+                "fallback_ratio=%.3f valid_ratio=%.3f",
+                stats['eig_min'], stats['eig_mean'], stats['eig_max'],
+                axis_min, axis_max, stats['fallback_ratio'], valid_any.float().mean().item()
+            )
+
+        if (self.profile_mgc and self._is_main_process and
+                (self._mgc_debug_step % self.profile_mgc_every == 0) and t_start is not None):
+            elapsed = (time.perf_counter() - t_start) * 1000.0
+            self.logger.info("[MGC] build_image_sampling_locations time=%.2f ms", elapsed)
+
+        return sampling_locations, {
+            'view_idx': view_idx,
+            'valid_mask': valid_any,
+            'fallback_mask': fallback_mask,
+            'sample_res': (sample_h, sample_w),
+        }
     
     def forward(self, query_bbox, query_feat, sampling_offset, gaussian_params, d_region):
         """
@@ -600,6 +1084,10 @@ class GGAModule(nn.Module):
         bias_scale=1.0,  # 偏置缩放系数
         bias_min=GEOMETRY_BIAS_MIN,  # 偏置下限
         use_query_projection=False,  # 是否对 Query 做投影
+        soft_clamp_min=None,  # 软截断下限（None 表示关闭）
+        soft_clamp_beta=1.0,  # 软截断平滑系数
+        debug_gga=False,  # 是否输出 GGA 调试信息
+        debug_gga_every=100,  # 调试输出间隔
         init_cfg=None,
     ):
         super().__init__()
@@ -609,6 +1097,17 @@ class GGAModule(nn.Module):
         self.bias_scale = bias_scale
         self.bias_min = bias_min
         self.use_query_projection = use_query_projection
+        self.soft_clamp_min = soft_clamp_min
+        self.soft_clamp_beta = soft_clamp_beta
+        self.debug_gga = debug_gga
+        self.debug_gga_every = debug_gga_every
+        self._gga_debug_step = 0
+        self.logger = logging.getLogger()
+        try:
+            rank, _ = get_dist_info()
+        except Exception:
+            rank = 0
+        self._is_main_process = (rank == 0)
         
         if learnable_temperature:
             self.temperature = nn.Parameter(torch.tensor(temperature))
@@ -646,6 +1145,12 @@ class GGAModule(nn.Module):
         mahal_dist_sq = (diff ** 2 * inv_var).sum(dim=-1)  # [B, Q, M]
         
         return mahal_dist_sq
+
+    def _soft_clamp_min(self, x):
+        if self.soft_clamp_min is None:
+            return x
+        beta = max(float(self.soft_clamp_beta), 1e-6)
+        return self.soft_clamp_min + F.softplus((x - self.soft_clamp_min) * beta) / beta
     
     def compute_geometry_bias(self, query_bbox, query_feat, gaussian_params, pc_range):
         """
@@ -669,6 +1174,7 @@ class GGAModule(nn.Module):
         
         gaussian_centers = gaussian_params['centers']  # [B, M, 2]
         gaussian_sigmas = gaussian_params['sigmas']    # [B, M, 2]
+        gaussian_precision = gaussian_params.get('precision', None)  # [B, M, 2, 2]
         gaussian_mask = gaussian_params.get('mask', None)  # [B, M] or None
         M = gaussian_centers.shape[1]
         
@@ -687,16 +1193,24 @@ class GGAModule(nn.Module):
         gaussian_centers = torch.nan_to_num(gaussian_centers, nan=0.0)
         gaussian_sigmas = torch.nan_to_num(gaussian_sigmas, nan=1.0)
 
-        mahal_dist_sq = self.compute_mahalanobis_distance(
-            query_centers_phys, gaussian_centers, gaussian_sigmas
-        )  # [B, Q, M]
+        if gaussian_precision is not None:
+            diff = query_centers_phys.unsqueeze(2) - gaussian_centers.unsqueeze(1)  # [B, Q, M, 2]
+            diff_vec = diff.unsqueeze(-1)  # [B, Q, M, 2, 1]
+            prec = gaussian_precision.unsqueeze(1)  # [B, 1, M, 2, 2]
+            term = torch.matmul(prec, diff_vec)
+            mahal_dist_sq = torch.matmul(diff_vec.transpose(-1, -2), term).squeeze(-1).squeeze(-1)  # [B, Q, M]
+        else:
+            mahal_dist_sq = self.compute_mahalanobis_distance(
+                query_centers_phys, gaussian_centers, gaussian_sigmas
+            )  # [B, Q, M]
         
         # 计算几何偏置
         # B_geom = -0.5 * d^2 / temperature * scale
         temperature = self.temperature.clamp(min=0.1)
         geometry_bias = -0.5 * mahal_dist_sq / temperature * self.bias_scale_param
         
-        # Clamp 到合理范围
+        # 软截断或硬截断
+        geometry_bias = self._soft_clamp_min(geometry_bias)
         geometry_bias = geometry_bias.clamp(min=self.bias_min)
         
         # 扩展到 num_heads 维度
@@ -737,7 +1251,7 @@ class GGAModule(nn.Module):
         
         if geometry_bias is None:
             return attn_logits, {}
-        
+
         B, num_heads, Q, K = attn_logits.shape
         M = geometry_bias.shape[-1]
         
@@ -745,14 +1259,24 @@ class GGAModule(nn.Module):
         # 简化处理：如果 K > M，对 bias 做广播；如果 K < M，截断或求最近
         if K == M:
             adjusted_logits = attn_logits + geometry_bias
+            bias_used = geometry_bias
         elif K > M:
             # 扩展 geometry_bias
             padding = torch.zeros(B, num_heads, Q, K - M, device=geometry_bias.device, dtype=geometry_bias.dtype)
             geometry_bias_padded = torch.cat([geometry_bias, padding], dim=-1)
             adjusted_logits = attn_logits + geometry_bias_padded
+            bias_used = geometry_bias_padded
         else:
             # 截断 geometry_bias
             adjusted_logits = attn_logits + geometry_bias[..., :K]
+            bias_used = geometry_bias[..., :K]
+
+        self._gga_debug_step += 1
+        if self.debug_gga and self._is_main_process and (self._gga_debug_step % self.debug_gga_every == 0):
+            b_min = bias_used.min().item()
+            b_mean = bias_used.mean().item()
+            b_max = bias_used.max().item()
+            self.logger.info("[GGA] bias(min/mean/max)=(%.2f, %.2f, %.2f)", b_min, b_mean, b_max)
         
         return adjusted_logits, {
             'geometry_bias': geometry_bias,

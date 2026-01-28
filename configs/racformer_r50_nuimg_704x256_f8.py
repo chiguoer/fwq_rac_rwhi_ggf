@@ -334,6 +334,9 @@ eval_config = dict(interval=2)
 
 # other flags
 debug = False
+sync_bn = True
+find_unused_parameters = True
+broadcast_buffers = False
 
 custom_hooks = [
     dict(

@@ -116,9 +116,16 @@ rwhi_cfg = dict(
 # ============ GGF2.0 配置 ============
 # GGF (Geometry-Guided Fusion) 模块配置
 # 所有子模块都可单独开关，方便消融实验
+# 典型组合示例（建议用 --override 快速切换）：
+# A: RGF-only
+#   --override ggf_cfg.enabled=True ggf_cfg.use_native_rgf=True ggf_cfg.use_gga=False ggf_cfg.use_mgc=False
+# B: RGF + GGA
+#   --override ggf_cfg.enabled=True ggf_cfg.use_native_rgf=True ggf_cfg.use_gga=True ggf_cfg.use_mgc=False
+# C: Full UPG (RGF + GGA + MGC)
+#   --override ggf_cfg.enabled=True ggf_cfg.use_native_rgf=True ggf_cfg.use_gga=True ggf_cfg.use_mgc=True
 ggf_cfg = dict(
     # 总开关
-    enabled=False,  # 默认关闭，打开后启用 GGF2.0
+    enabled=True,  # 默认开启，启用 GGF2.0
     
     # 子模块开关
     use_mgc=True,           # MGC: 视觉修正雷达几何
@@ -136,6 +143,14 @@ ggf_cfg = dict(
         rgf_sigma_y=3.0,        # 默认 y 方向标准差 (m)
         rgf_use_velocity=True,  # 根据速度调整各向异性
         rgf_velocity_scale=0.1, # 速度影响协方差的比例
+        rgf_kernel_size=7,      # 局部散射核尺寸
+        rgf_predict_params=True,  # 预测 (sx, sy, theta)
+        rgf_input_indices=[0, 1, 2, 3, 4],  # x,y,z,rcs,v_r
+        rgf_hidden_dims=64,
+        rgf_use_rotation=True,
+        rgf_theta_scale=3.1415926,
+        rgf_profile=False,
+        rgf_profile_every=100,
         
         # 场缩放参数（与 RWHI 打分场数值尺度保持一致）
         linear_scale=1.0,       # 线性场缩放
@@ -154,6 +169,20 @@ ggf_cfg = dict(
         constraint_strength=1.0,    # 约束强度
         ellipse_scale=2.0,          # 椭圆半径倍数
         learnable_strength=True,    # 可学习的约束强度
+        use_image_sampling=True,    # 仅作用于图像分支采样
+        sample_res=(3, 4),          # 与 num_points*depth_num 对齐 (3*4=12)
+        view_select='first_valid',
+        min_depth=1e-5,
+        align_corners=True,
+        spd_eig_min=1e-4,
+        spd_eig_max=None,
+        fallback_scale=1e-2,
+        max_dist=30.0,
+        debug_mgc=True,
+        debug_mgc_every=1000,
+        debug_mgc_max_print=5,
+        profile_mgc=False,
+        profile_mgc_every=100,
     ),
     
     # GGA 参数
@@ -164,6 +193,10 @@ ggf_cfg = dict(
         bias_scale=1.0,             # 偏置缩放系数
         bias_min=-100.0,            # 偏置下限
         use_query_projection=False, # 是否对 Query 做投影
+        soft_clamp_min=-100.0,      # 软截断下限
+        soft_clamp_beta=1.0,
+        debug_gga=True,
+        debug_gga_every=1000,
     ),
 )
 # ============ GGF2.0 配置结束 ============
@@ -198,7 +231,7 @@ img_backbone = dict(
     norm_cfg=dict(type='BN2d', requires_grad=True),
     norm_eval=True,
     style='pytorch',
-    with_cp=True)
+    with_cp=False)
 
 img_neck = dict(
     type='FPN',
@@ -427,12 +460,12 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=1e-4,
+    lr=4e-4,
     paramwise_cfg=dict(custom_keys={
         'img_backbone': dict(lr_mult=0.1),
         'sampling_offset': dict(lr_mult=0.1),
         # RWHI 模块可以使用较小的学习率
-        'rwhi_module': dict(lr_mult=1.1),
+        'rwhi_module': dict(lr_mult=0.8),
     }),
     weight_decay=0.01
 )
@@ -456,8 +489,8 @@ total_epochs = 20
 batch_size = 4
 
 # load pretrained weights
-#load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
-load_from = 'pretrain/rwhi-v7-e2.pth'
+load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
+#load_from = 'pretrain/rwhi-v7-e2.pth'
 revise_keys = [('backbone', 'img_backbone')]
 
 # resume the last training
@@ -491,4 +524,3 @@ custom_hooks = [
         start_epoch=18,
     ),
 ]
-

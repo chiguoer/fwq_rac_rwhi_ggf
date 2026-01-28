@@ -396,8 +396,8 @@ total_epochs = 20
 batch_size = 4
 
 # load pretrained weights
-#load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
-load_from = 'pretrain/rwhi-v7-e2.pth'
+load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
+#load_from = 'pretrain/rwhi-v7-e2.pth'
 revise_keys = [('backbone', 'img_backbone')]
 
 # resume the last training

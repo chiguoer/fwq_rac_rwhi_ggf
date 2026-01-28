@@ -10,7 +10,7 @@ from .bbox.utils import decode_bbox, theta_d2xy_coods, xy2theta_d_coods, R_MAX
 from .utils import inverse_sigmoid, DUMP
 from .sparsebev_sampling import sampling_4d, make_sample_points
 from .checkpoint import checkpoint as cp
-from .csrc.wrapper import MSMV_CUDA
+from .csrc.wrapper import MSMV_CUDA, msmv_sampling
 
 from .bev_self_attention import BEVSelfAttention
 
@@ -352,31 +352,25 @@ class RaCFormerTransformerDecoderLayer(BaseModule):
 
         # 获取当前层的 d_region
         d_region = self.d_region_list[layer]
-        
-        # ============ MGC 集成：BEV Sampling ============
-        # MGC 可以影响 BEV 采样的区域约束
-        # 当前实现中，MGC 通过调整 d_region 来间接影响采样
-        effective_d_region = d_region
-        if self.ggf_use_mgc and ggf_module is not None:
-            # 从 GGF 获取 MGC 约束信息
-            mgc_info = {}
-            if hasattr(ggf_module, 'mgc') and ggf_module.mgc is not None:
-                _, mgc_info = ggf_module.apply_mgc(
-                    query_bbox, query_feat, 
-                    torch.zeros(query_feat.shape[0], query_feat.shape[1], 1, 3, device=query_feat.device),
-                    d_region
-                )
-                if 'adjusted_d_region' in mgc_info and mgc_info['adjusted_d_region'] is not None:
-                    # MGC 提供的是 per-query 的 d_region，直接传递给 sampling 模块
-                    effective_d_region = mgc_info['adjusted_d_region'].clamp(min=d_region * 0.3, max=d_region)
 
-        query_radar_feat = self.sampling_radar_bev(query_bbox, query_feat, radar_bev_feats, img_metas, d_region=effective_d_region)
+        # ============ BEV Sampling ============
+        query_radar_feat = self.sampling_radar_bev(query_bbox, query_feat, radar_bev_feats, img_metas, d_region=d_region)
         query_radar_feat = self.norm_radar_bev(query_radar_feat)
-        query_lss_feat = self.sampling_lss_bev(query_bbox, query_feat, lss_bev_feats, img_metas, d_region=effective_d_region)
+        query_lss_feat = self.sampling_lss_bev(query_bbox, query_feat, lss_bev_feats, img_metas, d_region=d_region)
         query_lss_feat = self.norm_lss_bev(query_lss_feat)
 
         # ============ MGC 集成：Image Sampling ============
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas, d_region=effective_d_region)
+        mgc_module = None
+        gaussian_params = None
+        if self.ggf_use_mgc and ggf_module is not None and hasattr(ggf_module, 'mgc'):
+            mgc_module = ggf_module.mgc
+            gaussian_params = ggf_module.get_cached_params() if hasattr(ggf_module, 'get_cached_params') else None
+        sampled_feat = self.sampling(
+            query_bbox, query_feat, mlvl_feats, img_metas,
+            d_region=d_region,
+            mgc_module=mgc_module,
+            gaussian_params=gaussian_params,
+        )
 
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         
@@ -503,7 +497,46 @@ class RaCFormerSampling(BaseModule):
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
         
     
-    def inner_forward(self, query_ray, query_feat, mlvl_feats, img_metas, d_region=0.1):
+    def inner_forward_mgc(self, query_ray, query_feat, mlvl_feats, img_metas, mgc_module, gaussian_params):
+        """
+        MGC 图像分支采样：使用 affine_grid 构造椭圆采样位置
+        """
+        B, Q, _ = query_ray.shape
+        # 生成多尺度权重
+        scale_weights = self.scale_weights(query_feat).view(B, Q, self.num_groups, self.num_frames, self.depth_num * self.num_points, self.num_levels).contiguous()
+        scale_weights = torch.softmax(scale_weights, dim=-1)
+
+        # MGC 采样位置 (B, Q, P, 3) in [0,1]
+        sample_h, sample_w = self.depth_num, self.num_points
+        if getattr(mgc_module, 'sample_res', None) is not None:
+            cfg_h, cfg_w = mgc_module.sample_res
+            if cfg_h * cfg_w == sample_h * sample_w:
+                sample_h, sample_w = cfg_h, cfg_w
+        sampling_locations, mgc_info = mgc_module.build_image_sampling_locations(
+            query_ray, query_feat, gaussian_params, img_metas, self.pc_range, sample_res=(sample_h, sample_w)
+        )
+        if sampling_locations is None:
+            return None, None
+
+        # 扩展到 T、G 维度
+        sampling_locations = sampling_locations.unsqueeze(2).unsqueeze(3)  # [B, Q, 1, 1, P, 3]
+        sampling_locations = sampling_locations.expand(B, Q, self.num_frames, self.num_groups, -1, 3)
+        sampling_locations = sampling_locations.permute(0, 2, 3, 1, 4, 5).contiguous()
+        sampling_locations = sampling_locations.view(B * self.num_frames * self.num_groups, Q, -1, 3).contiguous()
+
+        scale_weights = scale_weights.permute(0, 2, 3, 1, 4, 5).contiguous()
+        scale_weights = scale_weights.view(B * self.num_groups * self.num_frames, Q, -1, self.num_levels).contiguous()
+
+        # 多尺度采样
+        final = msmv_sampling(mlvl_feats, sampling_locations, scale_weights)  # [BTG, Q, C, P]
+        C = final.shape[2]
+        final = final.view(B, self.num_frames, self.num_groups, Q, C, -1)
+        final = final.permute(0, 3, 2, 1, 5, 4).contiguous()  # [B, Q, G, T, P, C]
+        final = final.flatten(3, 4)  # [B, Q, G, FP, C]
+        valid_mask = mgc_info.get('valid_mask', None) if isinstance(mgc_info, dict) else None
+        return final, valid_mask
+
+    def inner_forward_default(self, query_ray, query_feat, mlvl_feats, img_metas, d_region=0.1):
         '''
         query_bbox: [B, Q, 10]
         query_feat: [B, Q, C]
@@ -570,14 +603,29 @@ class RaCFormerSampling(BaseModule):
         )  # [B, Q, G, FP, C]
 
         return sampled_feats
+
+    def inner_forward(self, query_ray, query_feat, mlvl_feats, img_metas, d_region=0.1, mgc_module=None, gaussian_params=None):
+        '''
+        query_bbox: [B, Q, 10]
+        query_feat: [B, Q, C]
+        '''
+        if mgc_module is not None and getattr(mgc_module, 'use_image_sampling', False):
+            mgc_feats, valid_mask = self.inner_forward_mgc(query_ray, query_feat, mlvl_feats, img_metas, mgc_module, gaussian_params)
+            if mgc_feats is not None:
+                if valid_mask is not None and (~valid_mask).any():
+                    base_feats = self.inner_forward_default(query_ray, query_feat, mlvl_feats, img_metas, d_region=d_region)
+                    mask = valid_mask.to(mgc_feats.dtype).view(valid_mask.shape[0], valid_mask.shape[1], 1, 1, 1)
+                    mgc_feats = mgc_feats * mask + base_feats * (1.0 - mask)
+                return mgc_feats
+        return self.inner_forward_default(query_ray, query_feat, mlvl_feats, img_metas, d_region=d_region)
     
     
     
-    def forward(self, query_ray, query_feat, mlvl_feats, img_metas, d_region=0.1):
+    def forward(self, query_ray, query_feat, mlvl_feats, img_metas, d_region=0.1, mgc_module=None, gaussian_params=None):
         if self.training and query_feat.requires_grad:
-            return cp(self.inner_forward, query_ray, query_feat, mlvl_feats, img_metas, d_region=d_region, use_reentrant=False)
+            return cp(self.inner_forward, query_ray, query_feat, mlvl_feats, img_metas, d_region, mgc_module, gaussian_params, use_reentrant=False)
         else:
-            return self.inner_forward(query_ray, query_feat, mlvl_feats, img_metas, d_region=d_region)
+            return self.inner_forward(query_ray, query_feat, mlvl_feats, img_metas, d_region=d_region, mgc_module=mgc_module, gaussian_params=gaussian_params)
 
 class BEVSampling(BaseModule):
     """Adaptive Spatio-temporal Sampling"""

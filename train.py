@@ -4,12 +4,13 @@ import shutil
 import logging
 import argparse
 import importlib
+import time
 import torch
 import torch.distributed as dist
 from datetime import datetime
 from mmcv.utils import Config, DictAction
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import EpochBasedRunner, build_optimizer, load_checkpoint
+from mmcv.runner import EpochBasedRunner, build_optimizer, load_checkpoint, init_dist, get_dist_info
 from mmdet.apis import set_random_seed
 from mmdet.core import DistEvalHook, EvalHook
 from mmdet3d.datasets import build_dataset
@@ -17,12 +18,62 @@ from mmdet3d.models import build_model
 from loaders.builder import build_dataloader
 from os import path as osp
 
+class MaxIterEpochBasedRunner(EpochBasedRunner):
+    """Epoch runner with an optional max_iters early-stop for debug."""
+    def __init__(self, *args, max_iters=None, rank_debug_interval=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._user_max_iters = max_iters
+        self._rank_debug_interval = rank_debug_interval
+
+    def train(self, data_loader, **kwargs):
+        self.model.train()
+        self.mode = 'train'
+        self.data_loader = data_loader
+        self._max_iters = self._max_epochs * len(self.data_loader)
+        self.call_hook('before_train_epoch')
+        time.sleep(2)  # Prevent possible deadlock during epoch transition
+        reached_max_iters = False
+        for i, data_batch in enumerate(self.data_loader):
+            self.data_batch = data_batch
+            self._inner_iter = i
+            self.call_hook('before_train_iter')
+            self.run_iter(data_batch, train_mode=True, **kwargs)
+            if self._rank_debug_interval and (self._iter % self._rank_debug_interval == 0):
+                try:
+                    rank, _ = get_dist_info()
+                except Exception:
+                    rank = 0
+                loss_val = None
+                if isinstance(self.outputs, dict) and 'loss' in self.outputs:
+                    try:
+                        loss_val = float(self.outputs['loss'])
+                    except Exception:
+                        loss_val = None
+                print(f"[Rank {rank}] iter={self._iter} loss={loss_val}")
+            self.call_hook('after_train_iter')
+            del self.data_batch
+            self._iter += 1
+            cur_iter = self._iter
+            if self._user_max_iters is not None and cur_iter >= self._user_max_iters:
+                self.logger.info('Max iters reached (%d), stopping early.', self._user_max_iters)
+                reached_max_iters = True
+                break
+
+        self.call_hook('after_train_epoch')
+        self._epoch += 1
+        if reached_max_iters:
+            self._max_epochs = self._epoch
+
 def main():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('--config', required=True)
     parser.add_argument('--override', nargs='+', action=DictAction)
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--world_size', type=int, default=1)
+    parser.add_argument('--max_iters', type=int, default=None,
+                        help='Stop training after N iterations (debug only).')
+    parser.add_argument('--rank_debug_interval', type=int, default=0,
+                        help='Print per-rank debug log every N iters (0 disables).')
     args = parser.parse_args()
 
     # parse configs
@@ -43,17 +94,19 @@ def main():
     # you need GPUs
     assert torch.cuda.is_available()
 
-    # determine local_rank and world_size
+    # determine local_rank, rank and world_size
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
-    
     if 'WORLD_SIZE' not in os.environ:
         os.environ['WORLD_SIZE'] = str(args.world_size)
+    if 'RANK' not in os.environ:
+        os.environ['RANK'] = '0'
 
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
+    rank = int(os.environ['RANK'])
 
-    if local_rank == 0:
+    if rank == 0:
         # resume or start a new run
         if cfgs.resume_from is not None:
             assert os.path.isfile(cfgs.resume_from)
@@ -90,7 +143,10 @@ def main():
 
     if world_size > 1:
         logging.info('Initializing DDP with %d GPUs...' % world_size)
-        dist.init_process_group('nccl', init_method='env://')
+        dist_params = cfgs.get('dist_params', {})
+        dist_params.setdefault('backend', 'nccl')
+        init_dist('pytorch', **dist_params)
+        rank, world_size = get_dist_info()
 
     logging.info('Setting random seed: 0')
     set_random_seed(0, deterministic=True)
@@ -122,7 +178,7 @@ def main():
     model = build_model(cfgs.model)
     model.init_weights()
 
-    sync_bn = True
+    sync_bn = cfgs.get('sync_bn', False)
     if world_size > 1 and sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         print('Convert to SyncBatchNorm')
@@ -137,20 +193,30 @@ def main():
     logging.info('Batch size per GPU: %d' % (cfgs.batch_size))
 
     if world_size > 1:
-        model = MMDistributedDataParallel(model, [local_rank], broadcast_buffers=False)
+        find_unused_parameters = cfgs.get('find_unused_parameters', True)
+        broadcast_buffers = cfgs.get('broadcast_buffers', False)
+        model = MMDistributedDataParallel(
+            model, [local_rank],
+            broadcast_buffers=broadcast_buffers,
+            find_unused_parameters=find_unused_parameters)
     else:
         model = MMDataParallel(model, [0])
 
     logging.info('Creating optimizer: %s' % cfgs.optimizer.type)
     optimizer = build_optimizer(model, cfgs.optimizer)
 
-    runner = EpochBasedRunner(
+    if args.max_iters is not None:
+        logging.info('Max iters (debug): %d', args.max_iters)
+
+    runner = MaxIterEpochBasedRunner(
         model,
         optimizer=optimizer,
         work_dir=work_dir,
         logger=logging.root,
         max_epochs=cfgs.total_epochs,
         meta=dict(),
+        max_iters=args.max_iters,
+        rank_debug_interval=args.rank_debug_interval,
     )
 
     runner.register_timer_hook(dict(type='IterTimerHook'))

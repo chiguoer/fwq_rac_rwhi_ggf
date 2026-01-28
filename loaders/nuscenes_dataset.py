@@ -19,6 +19,13 @@ renusc = NuScenes(version=nu_version, dataroot=str('data/nuscenes/'), verbose=Fa
 
 @DATASETS.register_module()
 class CustomNuScenesDataset(NuScenesDataset):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Ensure eval config is picklable for multi-worker DataLoader.
+        if hasattr(self, 'eval_detection_configs') and hasattr(self.eval_detection_configs, 'class_names'):
+            class_names = self.eval_detection_configs.class_names
+            if isinstance(class_names, type({}.keys())):
+                self.eval_detection_configs.class_names = list(class_names)
 
     def collect_sweeps(self, index, into_past=60, into_future=60):
         all_sweeps_prev = []

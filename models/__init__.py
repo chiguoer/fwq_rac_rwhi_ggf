@@ -5,12 +5,18 @@ from .model_utils import __all__
 
 # NOTE: necks may depend on optional CUDA extensions (e.g., bev_pool_v2_ext).
 # Keep import soft to allow lightweight unit tests (e.g., GGF) to run when
-# extensions are not built.
+# extensions are not built, but avoid swallowing unrelated errors.
 try:
     from .necks import __all__  # noqa: F401
-except Exception:
-    # Avoid hard failure when optional extensions are unavailable.
-    pass
+except Exception as exc:
+    if 'bev_pool_v2_ext' in str(exc):
+        import warnings
+        warnings.warn(
+            'Optional CUDA extension bev_pool_v2_ext is not available; '
+            'necks will not be registered for this session.'
+        )
+    else:
+        raise
 
 from .racformer import RaCFormer
 from .racformer_head import RaCFormer_head

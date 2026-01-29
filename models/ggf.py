@@ -15,6 +15,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from mmcv.runner import BaseModule, get_dist_info
 
 from .bbox.utils import R_MAX, theta_d2xy_coods, xy2theta_d_coods
@@ -339,13 +340,12 @@ class NativeRGF(nn.Module):
 
             dx = x_phys - centers_chunk[..., 0].unsqueeze(-1)
             dy = y_phys - centers_chunk[..., 1].unsqueeze(-1)
-            diff = torch.stack([dx, dy], dim=-1)  # [B, mc, K2, 2]
 
-            # 马氏距离
-            diff_vec = diff.unsqueeze(-1)  # [B, mc, K2, 2, 1]
-            prec = precision_chunk.unsqueeze(2)  # [B, mc, 1, 2, 2]
-            term = torch.matmul(prec, diff_vec)
-            mahal_sq = torch.matmul(diff_vec.transpose(-1, -2), term).squeeze(-1).squeeze(-1)  # [B, mc, K2]
+            # 马氏距离（2x2 标量展开，避免小矩阵 matmul）
+            p00 = precision_chunk[..., 0, 0].unsqueeze(-1)
+            p01 = precision_chunk[..., 0, 1].unsqueeze(-1)
+            p11 = precision_chunk[..., 1, 1].unsqueeze(-1)
+            mahal_sq = p00 * dx * dx + 2.0 * p01 * dx * dy + p11 * dy * dy  # [B, mc, K2]
 
             gaussian = amps_chunk.unsqueeze(-1) * torch.exp(-0.5 * mahal_sq)  # [B, mc, K2]
             gaussian = gaussian * valid.to(dtype)
@@ -413,6 +413,7 @@ class GeometryFieldBuilder(nn.Module):
         rgf_theta_scale=math.pi,
         rgf_profile=False,
         rgf_profile_every=100,
+        chunk_size=128,
         # 场缩放参数
         linear_scale=1.0,  # 线性场缩放
         linear_bias=1.0,   # 线性场基础偏置（对应背景分数）
@@ -454,6 +455,7 @@ class GeometryFieldBuilder(nn.Module):
                 theta_scale=rgf_theta_scale,
                 profile_rgf=rgf_profile,
                 profile_rgf_every=rgf_profile_every,
+                chunk_size=chunk_size,
             )
         else:
             self.native_rgf = None
@@ -783,31 +785,74 @@ class MGCModule(nn.Module):
             )
 
         sigma_sym_f = sigma_sym.float() if sigma_sym.dtype in (torch.float16, torch.bfloat16) else sigma_sym
-        eigvals, eigvecs = torch.linalg.eigh(sigma_sym_f)
 
-        eigvals_clamped = eigvals.clamp(min=self.spd_eig_min)
+        # 提取对称矩阵分量
+        a = sigma_sym_f[..., 0, 0]
+        b = sigma_sym_f[..., 0, 1]
+        d = sigma_sym_f[..., 1, 1]
+
+        # 防御性处理，避免 NaN/Inf 传播
+        a = torch.nan_to_num(
+            a, nan=self.fallback_scale ** 2, posinf=self.fallback_scale ** 2, neginf=self.fallback_scale ** 2
+        )
+        b = torch.nan_to_num(b, nan=0.0)
+        d = torch.nan_to_num(
+            d, nan=self.fallback_scale ** 2, posinf=self.fallback_scale ** 2, neginf=self.fallback_scale ** 2
+        )
+
+        # 基础正定约束：对角元素下限
+        eps = float(self.spd_eig_min)
+        a = a.clamp(min=eps)
+        d = d.clamp(min=eps)
+
+        # 可选的最大特征值限制：等比例缩放矩阵
         if self.spd_eig_max is not None:
-            eigvals_clamped = eigvals_clamped.clamp(max=self.spd_eig_max)
+            tr = a + d
+            diff = a - d
+            disc = torch.sqrt(diff * diff + 4.0 * b * b + EPS)
+            eig_max = 0.5 * (tr + disc)
+            scale = (self.spd_eig_max / eig_max).clamp(max=1.0)
+            a = a * scale
+            b = b * scale
+            d = d * scale
 
-        sigma_spd_f = eigvecs @ torch.diag_embed(eigvals_clamped) @ eigvecs.transpose(-1, -2)
+        # 保证最小特征值不低于 eps：对角线平移
+        tr = a + d
+        diff = a - d
+        disc = torch.sqrt(diff * diff + 4.0 * b * b + EPS)
+        eig_min = 0.5 * (tr - disc)
+        shift = (eps - eig_min).clamp(min=0.0)
+        a = a + shift
+        d = d + shift
+
+        # 进一步保证行列式下界
+        det = a * d - b * b
+        min_det = eps * eps
+        if min_det > 0:
+            max_b = torch.sqrt((a * d - min_det).clamp(min=0.0))
+            b = torch.sign(b) * torch.minimum(torch.abs(b), max_b)
+
+        # 重建 SPD 矩阵
+        sigma_spd_f = torch.stack(
+            [torch.stack([a, b], dim=-1), torch.stack([b, d], dim=-1)],
+            dim=-2,
+        )
         sigma_spd = sigma_spd_f.to(dtype=dtype)
 
-        fallback_mask = torch.zeros_like(eigvals_clamped[..., 0], dtype=torch.bool)
-        try:
-            L_f = torch.linalg.cholesky(sigma_spd_f)
-            info = None
-        except RuntimeError as exc:
-            if self.debug_mgc and self._is_main_process and self._mgc_debug_prints < self.debug_mgc_max_print:
-                self.logger.warning('[MGC] cholesky failed, fallback to cholesky_ex: %s', exc)
-                self._mgc_debug_prints += 1
-            L_f, info = torch.linalg.cholesky_ex(sigma_spd_f, check_errors=False)
+        # 2x2 closed-form Cholesky 分解
+        l11 = torch.sqrt(a)
+        l21 = b / l11
+        diag2_raw = d - l21 * l21
+        diag2 = diag2_raw.clamp(min=eps)
+        l22 = torch.sqrt(diag2)
 
-        if info is not None:
-            fallback_mask = info > 0
-            if fallback_mask.any() and self.debug_mgc and self._is_main_process and self._mgc_debug_prints < self.debug_mgc_max_print:
-                self.logger.warning('[MGC] cholesky_ex fallback triggered for some elements.')
-                self._mgc_debug_prints += 1
+        L_f = torch.zeros_like(sigma_spd_f)
+        L_f[..., 0, 0] = l11
+        L_f[..., 1, 0] = l21
+        L_f[..., 1, 1] = l22
 
+        # 若仍存在异常，回退到对角缩放
+        fallback_mask = (~torch.isfinite(l11) | ~torch.isfinite(l21) | ~torch.isfinite(l22) | (diag2_raw <= 0))
         if fallback_mask.any():
             fallback_L = torch.zeros_like(L_f)
             fallback_L[..., 0, 0] = self.fallback_scale
@@ -819,14 +864,23 @@ class MGCModule(nn.Module):
                 sigma_spd
             )
 
+            a = torch.where(fallback_mask, torch.full_like(a, self.fallback_scale ** 2), a)
+            b = torch.where(fallback_mask, torch.zeros_like(b), b)
+            d = torch.where(fallback_mask, torch.full_like(d, self.fallback_scale ** 2), d)
+
         L = L_f.to(dtype=dtype)
 
         stats = None
         if self.debug_mgc:
+            tr = a + d
+            diff = a - d
+            disc = torch.sqrt(diff * diff + 4.0 * b * b + EPS)
+            eig_min_val = 0.5 * (tr - disc)
+            eig_max_val = 0.5 * (tr + disc)
             stats = {
-                'eig_min': eigvals_clamped.min().item(),
-                'eig_mean': eigvals_clamped.mean().item(),
-                'eig_max': eigvals_clamped.max().item(),
+                'eig_min': eig_min_val.min().item(),
+                'eig_mean': (0.5 * (eig_min_val + eig_max_val)).mean().item(),
+                'eig_max': eig_max_val.max().item(),
                 'fallback_ratio': fallback_mask.float().mean().item(),
             }
 
@@ -1086,6 +1140,8 @@ class GGAModule(nn.Module):
         use_query_projection=False,  # 是否对 Query 做投影
         soft_clamp_min=None,  # 软截断下限（None 表示关闭）
         soft_clamp_beta=1.0,  # 软截断平滑系数
+        chunk_size=256,  # 分块大小（按 M 维度切分，避免大 bias 张量）
+        return_geometry_bias=False,  # 是否返回完整 bias（会占用大量显存）
         debug_gga=False,  # 是否输出 GGA 调试信息
         debug_gga_every=100,  # 调试输出间隔
         init_cfg=None,
@@ -1099,6 +1155,8 @@ class GGAModule(nn.Module):
         self.use_query_projection = use_query_projection
         self.soft_clamp_min = soft_clamp_min
         self.soft_clamp_beta = soft_clamp_beta
+        self.chunk_size = chunk_size
+        self.return_geometry_bias = return_geometry_bias
         self.debug_gga = debug_gga
         self.debug_gga_every = debug_gga_every
         self._gga_debug_step = 0
@@ -1245,14 +1303,41 @@ class GGAModule(nn.Module):
             adjusted_logits: [B, num_heads, Q, K] 调整后的 logits
             gga_info: dict GGA 相关信息
         """
+        adjusted_logits, geometry_bias = self.forward_with_bias(
+            attn_logits, query_bbox, query_feat, gaussian_params, pc_range
+        )
+        if geometry_bias is None:
+            return adjusted_logits, {}
+        return adjusted_logits, {
+            'geometry_bias': geometry_bias,
+        }
+
+    def forward_with_bias(self, attn_logits, query_bbox, query_feat, gaussian_params, pc_range):
+        """
+        应用 GGA 几何偏置（返回几何偏置 Tensor，便于 checkpoint）
+
+        Returns:
+            adjusted_logits: [B, num_heads, Q, K] 调整后的 logits
+            geometry_bias: [B, num_heads, Q, M] 或 None
+        """
+        if gaussian_params is None or 'centers' not in gaussian_params:
+            return attn_logits, None
+
+        B, num_heads, Q, K = attn_logits.shape
+
+        # Chunked path to avoid [B, H, Q, M] allocation
+        if self.chunk_size is not None and self.chunk_size > 0:
+            return self._apply_geometry_bias_chunked(
+                attn_logits, query_bbox, query_feat, gaussian_params, pc_range
+            )
+
         geometry_bias = self.compute_geometry_bias(
             query_bbox, query_feat, gaussian_params, pc_range
         )
         
         if geometry_bias is None:
-            return attn_logits, {}
+            return attn_logits, None
 
-        B, num_heads, Q, K = attn_logits.shape
         M = geometry_bias.shape[-1]
         
         # 如果 K != M，需要处理维度不匹配
@@ -1278,9 +1363,116 @@ class GGAModule(nn.Module):
             b_max = bias_used.max().item()
             self.logger.info("[GGA] bias(min/mean/max)=(%.2f, %.2f, %.2f)", b_min, b_mean, b_max)
         
-        return adjusted_logits, {
-            'geometry_bias': geometry_bias,
-        }
+        return adjusted_logits, geometry_bias
+
+    def _apply_geometry_bias_chunked(self, attn_logits, query_bbox, query_feat, gaussian_params, pc_range):
+        """
+        分块计算几何偏置并直接加到 logits 上，避免构建 [B, H, Q, M] 大张量。
+        """
+        B, num_heads, Q, K = attn_logits.shape
+        device = attn_logits.device
+        dtype = attn_logits.dtype
+
+        gaussian_centers = gaussian_params['centers']  # [B, M, 2]
+        gaussian_sigmas = gaussian_params['sigmas']    # [B, M, 2]
+        gaussian_precision = gaussian_params.get('precision', None)  # [B, M, 2, 2]
+        gaussian_mask = gaussian_params.get('mask', None)  # [B, M] or None
+        M = gaussian_centers.shape[1]
+
+        # 获取 Query 的物理坐标
+        query_bbox_xy = theta_d2xy_coods(query_bbox)
+        query_centers = query_bbox_xy[..., :2]  # 归一化坐标 [B, Q, 2]
+        map_size = pc_range[3] - pc_range[0]
+        query_centers_phys = query_centers.clone()
+        query_centers_phys[..., 0] = query_centers[..., 0] * map_size + pc_range[0]
+        query_centers_phys[..., 1] = query_centers[..., 1] * map_size + pc_range[1]
+
+        # 防御性处理，避免 NaN/Inf 传播
+        gaussian_centers = torch.nan_to_num(gaussian_centers, nan=0.0)
+        gaussian_sigmas = torch.nan_to_num(gaussian_sigmas, nan=1.0)
+
+        temperature = self.temperature.clamp(min=0.1)
+        chunk_size = min(int(self.chunk_size), M) if M > 0 else 0
+        k_eff = min(K, M)
+
+        adjusted_logits = attn_logits.clone()
+
+        # 可选：根据 Query 特征调整偏置权重
+        if self.use_query_projection:
+            query_weight = self.query_proj(query_feat)  # [B, Q, num_heads]
+            query_weight = query_weight.permute(0, 2, 1).unsqueeze(-1)  # [B, num_heads, Q, 1]
+        else:
+            query_weight = None
+
+        # 是否返回完整 bias（仅当 M==K 时有意义）
+        should_return_bias = bool(self.return_geometry_bias and (M == K))
+        geometry_bias_out = None
+        if should_return_bias:
+            geometry_bias_out = attn_logits.new_empty((B, num_heads, Q, k_eff))
+
+        # debug 统计
+        if self.debug_gga:
+            b_min = float('inf')
+            b_max = float('-inf')
+            b_sum = 0.0
+            b_count = 0
+
+        if k_eff > 0 and chunk_size > 0:
+            for start in range(0, k_eff, chunk_size):
+                end = min(k_eff, start + chunk_size)
+                g_centers = gaussian_centers[:, start:end]  # [B, mc, 2]
+                g_sigmas = gaussian_sigmas[:, start:end]    # [B, mc, 2]
+                g_mask = gaussian_mask[:, start:end] if gaussian_mask is not None else None
+                if gaussian_precision is not None:
+                    g_precision = gaussian_precision[:, start:end]  # [B, mc, 2, 2]
+                    diff = query_centers_phys.unsqueeze(2) - g_centers.unsqueeze(1)  # [B, Q, mc, 2]
+                    diff_vec = diff.unsqueeze(-1)  # [B, Q, mc, 2, 1]
+                    prec = g_precision.unsqueeze(1)  # [B, 1, mc, 2, 2]
+                    term = torch.matmul(prec, diff_vec)
+                    mahal_dist_sq = torch.matmul(diff_vec.transpose(-1, -2), term).squeeze(-1).squeeze(-1)
+                else:
+                    diff = query_centers_phys.unsqueeze(2) - g_centers.unsqueeze(1)
+                    inv_var = 1.0 / (g_sigmas.unsqueeze(1) ** 2 + EPS)
+                    mahal_dist_sq = (diff ** 2 * inv_var).sum(dim=-1)
+
+                geometry_bias_chunk = -0.5 * mahal_dist_sq / temperature * self.bias_scale_param
+                geometry_bias_chunk = self._soft_clamp_min(geometry_bias_chunk)
+                geometry_bias_chunk = geometry_bias_chunk.clamp(min=self.bias_min)
+
+                if g_mask is not None:
+                    geometry_bias_chunk = geometry_bias_chunk.masked_fill(
+                        ~g_mask.unsqueeze(1), self.bias_min
+                    )
+
+                if query_weight is not None:
+                    bias_chunk = geometry_bias_chunk.unsqueeze(1) * query_weight
+                else:
+                    bias_chunk = geometry_bias_chunk.unsqueeze(1)
+
+                adjusted_logits[:, :, :, start:end] = adjusted_logits[:, :, :, start:end] + bias_chunk
+
+                if should_return_bias:
+                    geometry_bias_out[..., start:end] = bias_chunk
+
+                if self.debug_gga:
+                    b_min = min(b_min, bias_chunk.min().item())
+                    b_max = max(b_max, bias_chunk.max().item())
+                    b_sum += bias_chunk.sum().item()
+                    b_count += bias_chunk.numel()
+
+        if self.debug_gga and self._is_main_process:
+            self._gga_debug_step += 1
+            if self._gga_debug_step % self.debug_gga_every == 0:
+                if b_count > 0:
+                    b_mean = b_sum / float(b_count)
+                    self.logger.info(
+                        "[GGA] bias(min/mean/max)=(%.2f, %.2f, %.2f)", b_min, b_mean, b_max
+                    )
+
+        if not should_return_bias:
+            geometry_bias_out = attn_logits.new_empty((B, num_heads, Q, 0))
+
+        return adjusted_logits, geometry_bias_out
 
 
 # ============================================================
@@ -1433,7 +1625,28 @@ class GGFModule(BaseModule):
         """
         if not self.enabled or self.gga is None or not self.use_gga:
             return attn_logits, {}
-        
+
+        if self.training:
+            if self._cached_params is None or 'centers' not in self._cached_params:
+                return self.gga(
+                    attn_logits, query_bbox, query_feat,
+                    self._cached_params, self.pc_range
+                )
+
+            def _gga_forward(attn_logits_in, query_bbox_in, query_feat_in):
+                return self.gga.forward_with_bias(
+                    attn_logits_in, query_bbox_in, query_feat_in,
+                    self._cached_params, self.pc_range
+                )
+
+            adjusted_logits, geometry_bias = checkpoint(
+                _gga_forward, attn_logits, query_bbox, query_feat
+            )
+            gga_info = {}
+            if geometry_bias is not None:
+                gga_info['geometry_bias'] = geometry_bias
+            return adjusted_logits, gga_info
+
         return self.gga(
             attn_logits, query_bbox, query_feat,
             self._cached_params, self.pc_range

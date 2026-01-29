@@ -178,7 +178,7 @@ def main():
     model = build_model(cfgs.model)
     model.init_weights()
 
-    sync_bn = cfgs.get('sync_bn', False)
+    sync_bn = False  # Force disable SyncBN to reduce DDP overhead during debugging
     if world_size > 1 and sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         print('Convert to SyncBatchNorm')

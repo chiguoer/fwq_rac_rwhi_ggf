@@ -128,7 +128,7 @@ ggf_cfg = dict(
     enabled=True,  # 默认开启，启用 GGF2.0
     
     # 子模块开关
-    use_mgc=False,           # MGC: 视觉修正雷达几何
+    use_mgc=True,           # MGC: 视觉修正雷达几何
     use_gga=True,           # GGA: 几何引导注意力
     use_unified_field=True, # 统一场积分（用于 RWHI）
     use_native_rgf=True,    # 原生高斯场实现
@@ -151,6 +151,7 @@ ggf_cfg = dict(
         rgf_theta_scale=3.1415926,
         rgf_profile=False,
         rgf_profile_every=100,
+        chunk_size=512,
         
         # 场缩放参数（与 RWHI 打分场数值尺度保持一致）
         linear_scale=1.0,       # 线性场缩放
@@ -178,7 +179,7 @@ ggf_cfg = dict(
         spd_eig_max=None,
         fallback_scale=1e-2,
         max_dist=30.0,
-        debug_mgc=True,
+        debug_mgc=False,
         debug_mgc_every=1000,
         debug_mgc_max_print=5,
         profile_mgc=False,
@@ -195,6 +196,8 @@ ggf_cfg = dict(
         use_query_projection=False, # 是否对 Query 做投影
         soft_clamp_min=-100.0,      # 软截断下限
         soft_clamp_beta=1.0,
+        chunk_size=256,             # 按 M 维分块，避免巨大 bias 张量
+        return_geometry_bias=False, # 不返回完整 bias，避免显存暴涨
         debug_gga=True,
         debug_gga_every=1000,
     ),
@@ -427,7 +430,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    workers_per_gpu=4,
+    workers_per_gpu=2,
     train=dict(
         type=dataset_type,
         data_root=dataset_root,
@@ -486,7 +489,7 @@ lr_config = dict(
 )
 
 total_epochs = 20
-batch_size = 4
+batch_size = 2
 
 # load pretrained weights
 load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
@@ -517,6 +520,7 @@ eval_config = dict(interval=2)
 
 # other flags
 debug = False
+find_unused_parameters = False
 
 # DDP 配置
 # 注意：static_graph 不适用于此模型，因为计算图可能根据雷达数据变化

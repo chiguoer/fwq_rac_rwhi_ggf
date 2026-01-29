@@ -128,7 +128,7 @@ ggf_cfg = dict(
     enabled=True,  # 默认开启，启用 GGF2.0
     
     # 子模块开关
-    use_mgc=True,           # MGC: 视觉修正雷达几何
+    use_mgc=False,           # MGC: 视觉修正雷达几何
     use_gga=True,           # GGA: 几何引导注意力
     use_unified_field=True, # 统一场积分（用于 RWHI）
     use_native_rgf=True,    # 原生高斯场实现
@@ -517,6 +517,11 @@ eval_config = dict(interval=2)
 
 # other flags
 debug = False
+
+# DDP 配置
+# 注意：static_graph 不适用于此模型，因为计算图可能根据雷达数据变化
+# 通过 dummy sum 确保所有参数在每次迭代中都参与计算图
+static_graph = False
 
 custom_hooks = [
     dict(

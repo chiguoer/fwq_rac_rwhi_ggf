@@ -1466,7 +1466,27 @@ class GGFModule(BaseModule):
             linear_field: [B, 1, H, W] 线性空间几何场
             log_field: [B, 1, H, W] 对数空间几何偏置
         """
-        return self.build_geometry_field(radar_points, radar_mask, rwhi_i_radar_map)
+        linear_field, log_field = self.build_geometry_field(radar_points, radar_mask, rwhi_i_radar_map)
+        
+        # 【DDP 兼容性】确保 MGC 和 GGA 的参数参与计算图
+        # 这些模块可能不会在每次前向传播中被调用（取决于 _cached_params 是否为 None）
+        if self.training:
+            dummy = None
+            # MGC 模块参数
+            if self.mgc is not None:
+                for param in self.mgc.parameters():
+                    term = param.sum() * 0.0
+                    dummy = term if dummy is None else dummy + term
+            # GGA 模块参数
+            if self.gga is not None:
+                for param in self.gga.parameters():
+                    term = param.sum() * 0.0
+                    dummy = term if dummy is None else dummy + term
+            # 将 dummy 加到输出上
+            if dummy is not None and linear_field is not None:
+                linear_field = linear_field + dummy
+        
+        return linear_field, log_field
 
 
 # ============================================================

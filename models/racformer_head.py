@@ -323,13 +323,21 @@ class RaCFormer_head(DETRHead):
             query_feat = init_query_feat
         
         # 【关键修复】DDP 兼容性：确保所有参数都参与计算图
-        # 当 use_rwhi=True 时：rwhi_module, pos2content, alpha_fusion 可能不参与（空雷达点）
-        # 当 using_dynamic_rwhi=True 时：init_query_bbox 不参与（使用 RWHI 生成的锚点）
-        if self.training:
-            dummy = None  # 使用 None 而不是 0.0，避免 tensor 与 float 比较问题
+        # 不同情况下需要 dummy sum 的模块：
+        # 1. use_rwhi=True 且 using_dynamic_rwhi=False：所有 RWHI 模块都需要 dummy
+        # 2. use_rwhi=True 且 using_dynamic_rwhi=True 且 rwhi_affect_query=False：
+        #    pos2content, alpha_fusion, rwhi_gate 需要 dummy（它们没有被调用）
+        # 3. use_rwhi=True 且 using_dynamic_rwhi=True 且 rwhi_affect_query=True：不需要 dummy
+        # 注意：using_dynamic_rwhi=True 时，init_query_bbox 已通过 wl_from_init 参与计算图
+        if self.training and self.use_rwhi:
+            dummy = None
             
-            if self.use_rwhi:
-                # RWHI 相关模块
+            # 判断哪些模块需要 dummy sum
+            need_rwhi_module_dummy = not using_dynamic_rwhi
+            need_query_modules_dummy = not using_dynamic_rwhi or not self.rwhi_affect_query
+            
+            if need_query_modules_dummy:
+                # pos2content, alpha_fusion, rwhi_gate 未参与计算
                 modules = [self.pos2content]
                 if self.alpha_fusion is not None:
                     modules.append(self.alpha_fusion)
@@ -337,21 +345,16 @@ class RaCFormer_head(DETRHead):
                     for param in module.parameters():
                         term = param.sum() * 0.0
                         dummy = term if dummy is None else dummy + term
-                for param in self.rwhi_module.parameters():
-                    term = param.sum() * 0.0
-                    dummy = term if dummy is None else dummy + term
                 if isinstance(self.rwhi_gate, nn.Parameter):
                     term = self.rwhi_gate.sum() * 0.0
                     dummy = term if dummy is None else dummy + term
-                
-                # 【新增修复】当使用动态 RWHI 时，init_query_bbox 未参与计算
-                # 需要添加 dummy sum 确保其参与计算图
-                if using_dynamic_rwhi:
-                    for param in self.init_query_bbox.parameters():
-                        term = param.sum() * 0.0
-                        dummy = term if dummy is None else dummy + term
             
-            # 【修复】使用 isinstance 检查，避免 tensor 与 Python 值比较问题
+            if need_rwhi_module_dummy:
+                # rwhi_module 未参与计算
+                for param in self.rwhi_module.parameters():
+                    term = param.sum() * 0.0
+                    dummy = term if dummy is None else dummy + term
+            
             if dummy is not None:
                 query_feat = query_feat + dummy
         

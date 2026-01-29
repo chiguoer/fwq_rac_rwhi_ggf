@@ -425,6 +425,11 @@ eval_config = dict(interval=2)
 # other flags
 debug = False
 
+# DDP 配置
+# 注意：static_graph 不适用于此模型，因为计算图可能根据雷达数据变化
+# 通过 dummy sum 确保所有参数在每次迭代中都参与计算图
+static_graph = False
+
 custom_hooks = [
     dict(
         type='SequentialControlHook',

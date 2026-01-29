@@ -193,12 +193,17 @@ def main():
     logging.info('Batch size per GPU: %d' % (cfgs.batch_size))
 
     if world_size > 1:
-        find_unused_parameters = cfgs.get('find_unused_parameters', True)
+        find_unused_parameters = cfgs.get('find_unused_parameters', False)
         broadcast_buffers = cfgs.get('broadcast_buffers', False)
+        static_graph = cfgs.get('static_graph', False)  # 设置为 True 可解决 checkpoint + DDP 兼容性问题
         model = MMDistributedDataParallel(
             model, [local_rank],
             broadcast_buffers=broadcast_buffers,
             find_unused_parameters=find_unused_parameters)
+        # 启用 static_graph 模式，解决 checkpoint + DDP "mark ready twice" 问题
+        if static_graph:
+            model._set_static_graph()
+            logging.info('DDP static_graph enabled')
     else:
         model = MMDataParallel(model, [0])
 

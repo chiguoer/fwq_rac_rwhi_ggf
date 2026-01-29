@@ -797,6 +797,16 @@ class RWHIModule(BaseModule):
             # 注意：必须使用 repeat() 或 clone() 而非 expand()，避免计算图版本冲突
             anchors = self.safety_anchors.unsqueeze(0).repeat(B, 1, 1).to(device=device, dtype=dtype)
             alpha_values = torch.full((B, self.num_query, 1), self.alpha_const, device=device, dtype=dtype)
+            
+            # 【DDP 兼容性】即使 RWHI 禁用，也需要确保所有参数参与计算图
+            if self.training:
+                dummy = None
+                for param in self.parameters():
+                    term = param.sum() * 0.0
+                    dummy = term if dummy is None else dummy + term
+                if dummy is not None:
+                    alpha_values = alpha_values + dummy
+            
             return anchors, alpha_values
         
         B, M, C = radar_points.shape
@@ -881,6 +891,17 @@ class RWHIModule(BaseModule):
             alpha_values = torch.cat([base_alpha, alpha_topk], dim=1)
         else:
             anchors, alpha_values = anchors_topk, alpha_topk
+        
+        # 【DDP 兼容性】alpha_encoder 虽然被创建，但 encode_alpha() 方法目前未被调用
+        # 为确保 DDP 下所有参数都参与计算图，添加 dummy sum
+        if self.training and self.alpha_encoder is not None:
+            dummy = None
+            for param in self.alpha_encoder.parameters():
+                term = param.sum() * 0.0
+                dummy = term if dummy is None else dummy + term
+            if dummy is not None:
+                # 将 dummy 加到 alpha_values 上，确保参与计算图
+                alpha_values = alpha_values + dummy
         
         return anchors, alpha_values
 

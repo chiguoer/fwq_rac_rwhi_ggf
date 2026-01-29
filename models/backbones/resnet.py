@@ -82,7 +82,7 @@ class CustomResNet(nn.Module):
         x_tmp = x
         for lid, layer in enumerate(self.layers):
             if self.with_cp:
-                x_tmp = checkpoint.checkpoint(layer, x_tmp)
+                x_tmp = checkpoint.checkpoint(layer, x_tmp, use_reentrant=False)
             else:
                 x_tmp = layer(x_tmp)
             if lid in self.backbone_output_ids:

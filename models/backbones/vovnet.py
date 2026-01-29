@@ -233,7 +233,7 @@ class _OSA_module(nn.Module):
 
     def forward(self, x):
         if self.with_cp and self.training and x.requires_grad:
-            return cp.checkpoint(self._forward, x)
+            return cp.checkpoint(self._forward, x, use_reentrant=False)
         else:
             return self._forward(x)
 

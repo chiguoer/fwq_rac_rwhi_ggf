@@ -47,14 +47,14 @@ d_region_list = [0.08, 0.07, 0.06, 0.05, 0.04, 0.03]
 num_clusters = 6
 num_ray = 900 // num_clusters
 num_query = 900
-num_rwhi = 600
+num_rwhi = 750
+use_rwhi = True
 use_alpha = True
 alpha_const = 0.7
 rwhi_gate_init = 0.2
 rwhi_gate_const = 0.7
-loss_alpha_anchor_weight = 0.2
 # 控制 RWHI 是否影响 query 特征（默认 True，保持旧行为）
-rwhi_affect_query = False
+rwhi_affect_query = True
 
 # ============ RWHI v7 关键配置 ============
 # 全链路统一的极坐标半径 - 必须在所有地方保持一致
@@ -91,23 +91,20 @@ rwhi_cfg = dict(
     l_default=4.0,        # 默认物体长度 (物理值，会转为 log)
     h_default=1.5,        # 默认物体高度 (物理值，会转为 log)
     
-    # AlphaMLP 参数
+    # AlphaMLP 参数（仅 RWHI 内部雷达置信度）
     alpha_mlp_in_dim=3,   # 输入维度 [log1p(rcs), d_norm, v_norm]
     alpha_mlp_hidden=32,  # 隐藏层维度
     alpha_init_bias=1.0,  # 初始偏置，使初始 α ≈ 0.73
     alpha_const=alpha_const,  # use_alpha=False 时的常数 α
-    use_alpha=use_alpha,      # 控制是否启用 AlphaMLP/Encoder
-    
-    # AlphaEncoder 参数
-    d_alpha=2,            # α embedding 维度
-    alpha_encoder_hidden=8,
+    use_alpha=use_alpha,      # 控制是否启用 AlphaMLP
+    st_tau=0.05,             # Straight-Through 可微 Top-K 温度
 
     # 其他
     num_clusters=num_clusters,  # 距离层数量 (与 RaCFormer 一致)
     max_points=5000,      # 最大雷达点数
     enabled=True,         # 是否启用 RWHI
     num_rwhi=num_rwhi,    # 雷达引导锚点数量
-    enable_diverse_topk=False,
+    enable_diverse_topk=True,
     coarse_factor=4,
     max_per_cell=5,
 )
@@ -221,12 +218,11 @@ model = dict(
         sync_cls_avg_factor=True,
         
         # ============ RWHI v7 关键配置 ============
-        use_rwhi=True,                    # 启用 RWHI
-        use_alpha=use_alpha,              # 是否启用 α 学习与特征融合
-        rwhi_gate_init=rwhi_gate_init,    # use_alpha=True 时的可学习门控初值
-        rwhi_gate_const=rwhi_gate_const,  # use_alpha=False 时的固定门控
+        use_rwhi=use_rwhi,                    # 启用 RWHI
+        use_alpha=use_alpha,              # 是否启用 RWHI 内部 α（雷达置信度）
+        rwhi_gate_init=rwhi_gate_init,    # 可学习门控初值
+        rwhi_gate_const=rwhi_gate_const,  # 固定门控（备用）
         rwhi_affect_query=rwhi_affect_query,  # 从 config 控制是否启用
-        loss_alpha_anchor_weight=loss_alpha_anchor_weight,
         rwhi_cfg=rwhi_cfg,                # RWHI 配置
         polar_radius=R_MAX,               # 全链路统一 polar_radius
         # ============ RWHI v7 配置结束 ============
@@ -366,12 +362,12 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=1e-4,
+    lr=4e-4,
     paramwise_cfg=dict(custom_keys={
         'img_backbone': dict(lr_mult=0.1),
         'sampling_offset': dict(lr_mult=0.1),
         # RWHI 模块可以使用较小的学习率
-        'rwhi_module': dict(lr_mult=1.1),
+        'rwhi_module': dict(lr_mult=1.0),
     }),
     weight_decay=0.01
 )
@@ -395,8 +391,8 @@ total_epochs = 20
 batch_size = 4
 
 # load pretrained weights
-#load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
-load_from = 'pretrain/rwhi-v7-e2.pth'
+load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
+#load_from = 'pretrain/rwhi-v7-e2.pth'
 revise_keys = [('backbone', 'img_backbone')]
 
 # resume the last training

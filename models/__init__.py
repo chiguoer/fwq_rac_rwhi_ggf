@@ -7,9 +7,9 @@ from .model_utils import __all__
 from .racformer import RaCFormer
 from .racformer_head import RaCFormer_head
 from .racformer_transformer import RaCFormerTransformer
-from .rwhi import RWHIModule, AlphaMLP, AlphaEncoder, build_rwhi
+from .rwhi import RWHIModule, AlphaMLP, build_rwhi
 
 __all__ = [
     'RaCFormer', 'RaCFormer_head', 'RaCFormerTransformer',
-    'RWHIModule', 'AlphaMLP', 'AlphaEncoder', 'build_rwhi'
+    'RWHIModule', 'AlphaMLP', 'build_rwhi'
     ]

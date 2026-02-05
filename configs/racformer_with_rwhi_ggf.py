@@ -35,6 +35,7 @@ embed_dims = 256
 num_layers = 6
 
 num_frames = 8
+num_groups = 4  # 与 decoder 中的 num_groups 保持一致
 num_levels = 4
 num_points = 4
 num_points_bev = 4
@@ -47,12 +48,11 @@ d_region_list = [0.08, 0.07, 0.06, 0.05, 0.04, 0.03]
 num_clusters = 6
 num_ray = 900 // num_clusters
 num_query = 900
-num_rwhi = 600
-use_alpha = True
+num_rwhi = 450
+use_alpha = False
 alpha_const = 0.7
 rwhi_gate_init = 0.2
 rwhi_gate_const = 0.7
-loss_alpha_anchor_weight = 0.2
 # 控制 RWHI 是否影响 query 特征（默认 True，保持旧行为）
 rwhi_affect_query = False
 
@@ -82,7 +82,7 @@ rwhi_cfg = dict(
     epsilon=0.01,         # 微扰层系数
     diffusion_type='avg', # 扩散类型: 'max'/'avg'/'none'
     diffusion_kernel=2,   # 扩散核尺寸: 1/2/3；为1或type='none'时跳过池化
-    diffusion_gamma=0.2,  # 扩散系数 λ
+    diffusion_gamma=0.3,  # 扩散系数 λ
     diffusion_s_max=5.0,  # 得分上限
     
     # 默认值 (用于锚点初始化)
@@ -91,21 +91,18 @@ rwhi_cfg = dict(
     l_default=4.0,        # 默认物体长度 (物理值，会转为 log)
     h_default=1.5,        # 默认物体高度 (物理值，会转为 log)
     
-    # AlphaMLP 参数
+    # AlphaMLP 参数（仅 RWHI 内部雷达置信度）
     alpha_mlp_in_dim=3,   # 输入维度 [log1p(rcs), d_norm, v_norm]
     alpha_mlp_hidden=32,  # 隐藏层维度
     alpha_init_bias=1.0,  # 初始偏置，使初始 α ≈ 0.73
     alpha_const=alpha_const,  # use_alpha=False 时的常数 α
-    use_alpha=use_alpha,      # 控制是否启用 AlphaMLP/Encoder
-    
-    # AlphaEncoder 参数
-    d_alpha=2,            # α embedding 维度
-    alpha_encoder_hidden=8,
+    use_alpha=use_alpha,      # 控制是否启用 AlphaMLP
+    st_tau=0.05,             # Straight-Through 可微 Top-K 温度
 
     # 其他
     num_clusters=num_clusters,  # 距离层数量 (与 RaCFormer 一致)
     max_points=5000,      # 最大雷达点数
-    enabled=True,         # 是否启用 RWHI
+    enabled=False,         # 是否启用 RWHI
     num_rwhi=num_rwhi,    # 雷达引导锚点数量
     enable_diverse_topk=False,
     coarse_factor=4,
@@ -125,10 +122,10 @@ rwhi_cfg = dict(
 #   --override ggf_cfg.enabled=True ggf_cfg.use_native_rgf=True ggf_cfg.use_gga=True ggf_cfg.use_mgc=True
 ggf_cfg = dict(
     # 总开关
-    enabled=True,  # 默认开启，启用 GGF2.0
+    enabled=False,  # 默认开启，启用 GGF2.0
     
     # 子模块开关
-    use_mgc=True,           # MGC: 视觉修正雷达几何
+    use_mgc=False,           # MGC: 视觉修正雷达几何
     use_gga=True,           # GGA: 几何引导注意力
     use_unified_field=True, # 统一场积分（用于 RWHI）
     use_native_rgf=True,    # 原生高斯场实现
@@ -184,6 +181,9 @@ ggf_cfg = dict(
         debug_mgc_max_print=5,
         profile_mgc=False,
         profile_mgc_every=100,
+        # 从 config 下发给 MGC，保证与 decoder 一致
+        num_frames=num_frames,
+        num_groups=num_groups,
     ),
     
     # GGA 参数
@@ -312,12 +312,11 @@ model = dict(
         sync_cls_avg_factor=True,
         
         # ============ RWHI v7 关键配置 ============
-        use_rwhi=True,                    # 启用 RWHI
-        use_alpha=use_alpha,              # 是否启用 α 学习与特征融合
-        rwhi_gate_init=rwhi_gate_init,    # use_alpha=True 时的可学习门控初值
-        rwhi_gate_const=rwhi_gate_const,  # use_alpha=False 时的固定门控
+        use_rwhi=False,                    # 启用 RWHI
+        use_alpha=use_alpha,              # 是否启用 RWHI 内部 α（雷达置信度）
+        rwhi_gate_init=rwhi_gate_init,    # 可学习门控初值
+        rwhi_gate_const=rwhi_gate_const,  # 固定门控（备用）
         rwhi_affect_query=rwhi_affect_query,  # 从 config 控制是否启用
-        loss_alpha_anchor_weight=loss_alpha_anchor_weight,
         rwhi_cfg=rwhi_cfg,                # RWHI 配置
         polar_radius=R_MAX,               # 全链路统一 polar_radius
         # ============ RWHI v7 配置结束 ============
@@ -430,7 +429,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    workers_per_gpu=2,
+    workers_per_gpu=4,
     train=dict(
         type=dataset_type,
         data_root=dataset_root,
@@ -520,7 +519,7 @@ eval_config = dict(interval=2)
 
 # other flags
 debug = False
-find_unused_parameters = False
+find_unused_parameters = True
 
 # DDP 配置
 # 注意：static_graph 不适用于此模型，因为计算图可能根据雷达数据变化

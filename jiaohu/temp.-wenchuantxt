@@ -1,2 +1,28 @@
-现在本文件夹的cuda拓展已经配置好了，请你继续审阅代码，并通过
-测试racformer_with_rwhi_ggf.py进行冒烟测试，发现错误就更改
+双卡训练出问题的修复
+torchrun --nproc_per_node 2 train.py --config configs/racformer_with_rwhi_ggf.py
+\
+mkdir visual_outputs_gt 
+
+python visual/visual.py
+
+
+ torchrun --nproc_per_node 2 train.py --config configs/racformer_r50_nuimg_704x256_f8.py
+TORCH_DISTRIBUTED_DEBUG=DETAIL torchrun --nproc_per_node 2 train.py --config configs/racformer_r50_nuimg_704x256_f8.py
+
+
+(racrwhi) duanxiong@wang:/media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27$ python visual/visual.py
+Traceback (most recent call last):
+  File "visual/visual.py", line 28, in <module>
+    from render import visualize_sample, visualize_sample_radar
+ModuleNotFoundError: No module named 'render'
+
+(racrwhi) duanxiong@wang:/media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27$ python tools/visual.py
+Traceback (most recent call last):
+  File "tools/visual.py", line 28, in <module>
+    from render import visualize_sample, visualize_sample_radar
+  File "/media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27/tools/render.py", line 22, in <module>
+    from loaders.nuscenes_dataset import RadarPointCloud_v2
+ModuleNotFoundError: No module named 'loaders'
+
+cd /media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27
+PYTHONPATH=. python tools/visual.py

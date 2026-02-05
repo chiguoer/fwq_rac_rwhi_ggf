@@ -36,7 +36,6 @@ class RaCFormer_head(DETRHead):
                  rwhi_gate_init=0.2,
                  rwhi_gate_const=0.7,
                  rwhi_affect_query=True,
-                 loss_alpha_anchor_weight=0.2,
                  rwhi_cfg=None,
                  polar_radius=None,
                  # ============ GGF2.0 配置 ============
@@ -60,7 +59,6 @@ class RaCFormer_head(DETRHead):
         self.rwhi_affect_query = rwhi_affect_query
         self.rwhi_gate_init = rwhi_gate_init
         self._rwhi_gate_const_value = rwhi_gate_const
-        self.loss_alpha_anchor_weight = loss_alpha_anchor_weight
         self.rwhi_cfg = rwhi_cfg if rwhi_cfg is not None else {}
         self.rwhi_cfg.setdefault('use_alpha', self.use_alpha)
         
@@ -134,32 +132,21 @@ class RaCFormer_head(DETRHead):
             # sin, cos, vx, vy (indices 6, 7, 8, 9)
             self.init_query_bbox.weight[:, 6:10].copy_(safety_anchors[:, 6:10])
         
-        # pos2content: 将位置 [θ, d, z] 转换为内容特征
-        # 输出维度为 embed_dims - 1，留 1 维给 indicator
+        # pos2content: 只用位置生成动态内容
         self.pos2content = nn.Sequential(
             nn.Linear(3, self.embed_dims),
             nn.LayerNorm(self.embed_dims),
             nn.ReLU(inplace=True),
             nn.Linear(self.embed_dims, self.embed_dims - 1),
         )
-        # ✅ Fix 3: 零初始化最后一层，使 RWHI 初始时接近 identity
-        # 这样 fused_content ≈ 0，label_enc_base + fused_content ≈ label_enc_base
+        # 零初始化最后一层，使 RWHI 初始时接近 identity
         nn.init.zeros_(self.pos2content[-1].weight)
         nn.init.zeros_(self.pos2content[-1].bias)
         
-        # alpha_fusion: 融合 α embedding
-        if self.use_alpha:
-            d_alpha = self.rwhi_module.d_alpha
-            self.alpha_fusion = nn.Sequential(
-                nn.Linear(self.embed_dims - 1 + d_alpha, self.embed_dims - 1),
-                nn.LayerNorm(self.embed_dims - 1),
-            )
-            # Learnable gate for alpha-enabled mode
-            self.rwhi_gate = nn.Parameter(torch.tensor(self.rwhi_gate_init))
-        else:
-            self.alpha_fusion = None
-            self.rwhi_gate = None
-            self.register_buffer('rwhi_gate_const', torch.tensor(self._rwhi_gate_const_value))
+        # 不再使用 alpha_fusion / AlphaEncoder，将 rwhi_gate 简化为始终存在的可学习标量
+        self.alpha_fusion = None
+        self.rwhi_gate = nn.Parameter(torch.tensor(self.rwhi_gate_init, dtype=torch.float32))
+        self.register_buffer('rwhi_gate_const', torch.tensor(self._rwhi_gate_const_value, dtype=torch.float32))
 
     def init_weights(self):
         self.transformer.init_weights()
@@ -293,27 +280,13 @@ class RaCFormer_head(DETRHead):
         
         # 当 rwhi_affect_query=False 时，RWHI 只影响锚点分布，不再注入 query 内容
         if using_dynamic_rwhi and self.use_rwhi and self.rwhi_affect_query:
-            # 动态 query_feat
             query_pos = query_bbox[..., :3]  # [B, K, 3] (θ, d, z)
-            
-            # 位置 → 内容
             dynamic_content = self.pos2content(query_pos)  # [B, K, embed_dims-1]
-            
-            # ✅ Fix 1: 添加语义桥接 - 保留 label_enc 语义先验
-            # RWHI 特征作为增强而非替换，使用残差连接
             label_enc_base = self.label_enc.weight[self.num_classes].repeat(self.num_query, 1)
             label_enc_base = label_enc_base.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, K, embed_dims-1]
-            
-            # ✅ AMP dtype fix: Cast label_enc_base to match dynamic_content dtype
-            # label_enc.weight stays fp32, but dynamic_content may be fp16 under AMP
             label_enc_base = label_enc_base.to(dtype=dynamic_content.dtype)
-            
-            gate = self.rwhi_gate if self.use_alpha else self.rwhi_gate_const
-            if isinstance(gate, torch.Tensor):
-                gate = gate.to(dtype=dynamic_content.dtype)
+            gate = self.rwhi_gate.to(dtype=dynamic_content.dtype)
             query_feat_content = label_enc_base + gate * dynamic_content
-            
-            # 添加 indicator
             indicator = indicator0.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, K, 1]
             query_feat = torch.cat([query_feat_content, indicator], dim=-1)  # [B, K, embed_dims]
         else:
@@ -337,10 +310,7 @@ class RaCFormer_head(DETRHead):
             need_query_modules_dummy = not using_dynamic_rwhi or not self.rwhi_affect_query
             
             if need_query_modules_dummy:
-                # pos2content, alpha_fusion, rwhi_gate 未参与计算
                 modules = [self.pos2content]
-                if self.alpha_fusion is not None:
-                    modules.append(self.alpha_fusion)
                 for module in modules:
                     for param in module.parameters():
                         term = param.sum() * 0.0
@@ -756,56 +726,6 @@ class RaCFormer_head(DETRHead):
         
         return loss_cls, loss_bbox
 
-    def _loss_alpha_anchor(self,
-                           cls_scores,
-                           bbox_preds,
-                           alpha_values,
-                           gt_bboxes_list,
-                           gt_labels_list,
-                           gt_bboxes_ignore=None):
-        """仅基于最后一层 decoder 的 Hungarian 匹配计算锚点级 α 损失"""
-        num_imgs = cls_scores.size(0)
-        alpha_values = alpha_values.squeeze(-1)
-
-        loss_sum = alpha_values.new_tensor(0.0)
-        num_total = 0
-
-        for i in range(num_imgs):
-            _, _, _, _, pos_inds, neg_inds = self._get_target_single(
-                cls_scores[i],
-                bbox_preds[i],
-                gt_labels_list[i],
-                gt_bboxes_list[i],
-                gt_bboxes_ignore,
-            )
-            num_pos = pos_inds.numel()
-            num_neg = neg_inds.numel()
-            if num_pos + num_neg == 0:
-                continue
-
-            alpha_img = alpha_values[i]
-            alpha_pos = alpha_img[pos_inds] if num_pos > 0 else alpha_img.new_empty(0)
-            alpha_neg = alpha_img[neg_inds] if num_neg > 0 else alpha_img.new_empty(0)
-            label_pos = alpha_pos.new_ones(alpha_pos.shape)
-            label_neg = alpha_neg.new_zeros(alpha_neg.shape)
-
-            if num_pos > 0 and num_neg > 0:
-                alpha_sel = torch.cat([alpha_pos, alpha_neg], dim=0)
-                label_sel = torch.cat([label_pos, label_neg], dim=0)
-            else:
-                alpha_sel = alpha_pos if num_pos > 0 else alpha_neg
-                label_sel = label_pos if num_pos > 0 else label_neg
-
-            loss_sum = loss_sum + F.binary_cross_entropy(alpha_sel, label_sel, reduction='sum')
-            num_total += num_pos + num_neg
-
-        if num_total == 0:
-            return loss_sum
-
-        avg_factor = reduce_mean(alpha_values.new_tensor([num_total]))
-        avg_factor = torch.clamp(avg_factor, min=1.0)
-        return loss_sum / avg_factor
-
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self,
              gt_bboxes_list,
@@ -863,18 +783,6 @@ class RaCFormer_head(DETRHead):
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             num_dec_layer += 1
 
-        if self.training and self.use_alpha:
-            alpha_values = preds_dicts.get('alpha_values', None)
-            if alpha_values is not None:
-                loss_alpha_anchor = self._loss_alpha_anchor(
-                    all_cls_scores[-1],
-                    all_bbox_preds[-1],
-                    alpha_values,
-                    gt_bboxes_list,
-                    gt_labels_list,
-                    gt_bboxes_ignore,
-                )
-                loss_dict['loss_alpha_anchor'] = loss_alpha_anchor * self.loss_alpha_anchor_weight
         return loss_dict
 
     @force_fp32(apply_to=('preds_dicts'))

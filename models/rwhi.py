@@ -65,51 +65,6 @@ class AlphaMLP(nn.Module):
         return alpha
 
 
-class AlphaEncoder(nn.Module):
-    """
-    α 特征编码器
-    
-    将 α 编码为 d_alpha 维 embedding，用于 Query 特征增强。
-    不修改 bbox_proposal 的 10 维结构。
-    
-    输入: α ∈ (0, 1)
-    处理: α_center = (α - 0.5) * 2  → [-1, 1]
-          u = [α_center, α_center²]  → 2维
-    输出: Linear(2→hidden) → ReLU → Linear(hidden→d_alpha)
-    """
-    
-    def __init__(self, d_alpha=2, hidden_dim=8):
-        """
-        Args:
-            d_alpha: 输出 embedding 维度
-            hidden_dim: 隐藏层维度
-        """
-        super().__init__()
-        
-        self.fc1 = nn.Linear(2, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, d_alpha)
-        self.d_alpha = d_alpha
-    
-    def forward(self, alpha):
-        """
-        Args:
-            alpha: [B, K, 1] 置信度值，范围 (0, 1)
-        Returns:
-            embedding: [B, K, d_alpha] α 的特征编码
-        """
-        # α_center = (α - 0.5) * 2, 映射到 [-1, 1]
-        alpha_center = (alpha - 0.5) * 2.0
-        
-        # 构建输入: [α_center, α_center²]
-        u = torch.cat([alpha_center, alpha_center ** 2], dim=-1)  # [B, K, 2]
-        
-        # MLP 编码
-        x = F.relu(self.fc1(u))
-        embedding = self.fc2(x)
-        
-        return embedding
-
-
 class RWHIModule(BaseModule):
     """
     RWHI v7 核心模块
@@ -161,9 +116,8 @@ class RWHIModule(BaseModule):
         alpha_init_bias=1.0,
         alpha_const=0.7,
         use_alpha=True,
-        # AlphaEncoder 参数
-        d_alpha=2,
-        alpha_encoder_hidden=8,
+        # Straight-Through Top-K 温度
+        st_tau=0.05,
         # 其他
         num_clusters=6,
         max_points=5000,
@@ -204,9 +158,8 @@ class RWHIModule(BaseModule):
             alpha_mlp_hidden: AlphaMLP 隐藏层维度
             alpha_init_bias: AlphaMLP 初始偏置
             alpha_const: use_alpha=False 时使用的常数 α
-            use_alpha: 是否启用 AlphaMLP/Encoder
-            d_alpha: α embedding 维度
-            alpha_encoder_hidden: AlphaEncoder 隐藏层维度
+            use_alpha: 是否启用 AlphaMLP（仅 RWHI 内部雷达置信度）
+            st_tau: Straight-Through 可微 Top-K 的 softmax 温度
             num_clusters: 距离层数量 (用于 safety_anchors 生成)
             max_points: 最大雷达点数
             num_rwhi: 雷达 Top-K 锚点数量（<=0 时不启用）
@@ -253,7 +206,7 @@ class RWHIModule(BaseModule):
         self.max_points = max_points
         self.use_alpha = use_alpha
         self.alpha_const = alpha_const
-        self._d_alpha = d_alpha if use_alpha else 0
+        self.st_tau = float(st_tau)
         self.num_rwhi = int(num_rwhi) if num_rwhi is not None else self.num_query
         self.enable_diverse_topk = enable_diverse_topk
         self.coarse_factor = int(coarse_factor)
@@ -272,21 +225,15 @@ class RWHIModule(BaseModule):
         self.map_size = x_range  # 102.4
         self.grid_resolution = self.map_size / bev_grid_size
         
-        # 初始化子模块
+        # 初始化子模块：仅 AlphaMLP 用于点置信度
         if self.use_alpha:
             self.alpha_mlp = AlphaMLP(
                 in_dim=alpha_mlp_in_dim,
                 hidden_dim=alpha_mlp_hidden,
                 init_bias=alpha_init_bias
             )
-            
-            self.alpha_encoder = AlphaEncoder(
-                d_alpha=d_alpha,
-                hidden_dim=alpha_encoder_hidden
-            )
         else:
             self.alpha_mlp = None
-            self.alpha_encoder = None
         
         # 空间扩散层
         if self.diffusion_type not in ['max', 'avg', 'none']:
@@ -424,11 +371,6 @@ class RWHIModule(BaseModule):
         anchors[:, 8] = 0.0
         anchors[:, 9] = 0.0
         return anchors
-    
-    @property
-    def d_alpha(self):
-        """返回 α embedding 维度"""
-        return self._d_alpha
     
     @property
     def safety_anchors(self):
@@ -698,11 +640,9 @@ class RWHIModule(BaseModule):
     
     def _topk_to_anchors(self, S, alpha_map, batch_size, device, topk_k=None):
         """
-        从打分图提取 Top-K 位置，转换为 10 维锚点
-        
-        关键:
-        - 输出归一化值，不做 inverse_sigmoid
-        - d/z 必须 clamp 到 (EPS, 1-EPS)
+        从打分图提取 Top-K 位置，转换为 10 维锚点。
+        - Top-K 对 S 可微：前向用硬 Top-K，反向经 softmax 回传到 S（radar → α → I_radar → S → Top-K）。
+        - α 仅用 hard gather 从 alpha_map 取出 Top-K 位置的 α，不做 ST/soft 聚合。
         
         Args:
             S: [B, 1, H, W] 打分图
@@ -712,70 +652,50 @@ class RWHIModule(BaseModule):
         
         Returns:
             anchors: [B, K, 10] 10 维锚点
-            alpha_topk: [B, K, 1] Top-K 位置的 α 值
+            alpha_topk: [B, K, 1] Top-K 位置的 α 值（hard gather，范围 [0,1]）
         """
         H = W = self.bev_grid_size
         K = topk_k if topk_k is not None else self.num_query
-        dtype = S.dtype  # 【修复】AMP/FP16 兼容性
+        dtype = S.dtype
+        B = batch_size
         
-        # Top-K
-        S_flat = S.view(batch_size, -1)  # [B, H*W]
+        S_flat = S.view(B, -1)  # [B, H*W]
         topk_idx = self._select_topk_indices(S_flat, H, W, K)  # [B, K]
         
-        # 获取 α
+        # Straight-Through: soft 分布用于反向
+        tau = max(self.st_tau, 1e-6)
+        soft_p = F.softmax(S_flat / tau, dim=-1)  # [B, H*W]
+        coords_flat = self.grid_xy.to(device=device, dtype=dtype)  # [H*W, 2]
+        anchors_xy_soft = torch.matmul(soft_p, coords_flat)  # [B, 2]
+        anchors_xy_soft = anchors_xy_soft.unsqueeze(1).expand(B, K, 2)  # [B, K, 2]
+        
+        topk_xy_hard = self.grid_xy.to(device=device, dtype=dtype)[topk_idx]  # [B, K, 2]
+        topk_xy_st = topk_xy_hard.detach() + (anchors_xy_soft - anchors_xy_soft.detach())
+        theta_d = self._xy_to_theta_d(topk_xy_st)  # [B, K, 2]
+        
+        # α: 仅用 hard gather 从 alpha_map 取出 Top-K 位置的 α，不做 ST/soft 聚合
         alpha_flat = alpha_map.view(batch_size, -1)  # [B, H*W]
         alpha_topk = torch.gather(alpha_flat, 1, topk_idx)  # [B, K]
         alpha_topk = alpha_topk.clamp(0.0, 1.0).unsqueeze(-1)  # [B, K, 1]
         
-        # 坐标转换: 网格索引 → 物理坐标 → 极坐标
-        # grid_xy: [H*W, 2]
-        topk_xy = self.grid_xy.to(device=device, dtype=dtype)[topk_idx]  # [B, K, 2]
-        theta_d = self._xy_to_theta_d(topk_xy)  # [B, K, 2]
-        
-        # z_norm (已 clamp)
         z = torch.full(
-            (batch_size, K, 1),
-            self.z_default,
-            device=device,
-            dtype=dtype  # 【修复】
+            (B, K, 1), self.z_default, device=device, dtype=dtype
         ).clamp(min=EPS, max=1.0 - EPS)
+        h_log = 0.2
         
-        # ✅ Fix 2b: w/l 占位符，实际值由 racformer_head 从 init_query_bbox 替换
-        # 这里只是占位，确保输出维度正确，w/l 会在 _prepare_query_bbox 中被替换
-        # h: 设为 0.2，匹配原始值 exp(0.2)≈1.22m
-        h_log = 0.2  # ✅ 匹配原始值
-        
-        # 组装 10 维 【修复】所有 torch.full 添加 dtype
-        # 注意：w/l (indices 3,4) 是占位符，会被 racformer_head 用 init_query_bbox 的值替换
         anchors = torch.cat([
-            theta_d,  # [B, K, 2] (θ, d) - 来自 RWHI 打分图
-            z,        # [B, K, 1]
-            torch.zeros((batch_size, K, 1), device=device, dtype=dtype),  # w 占位符
-            torch.zeros((batch_size, K, 1), device=device, dtype=dtype),  # l 占位符
-            torch.full((batch_size, K, 1), h_log, device=device, dtype=dtype),  # h (log)
-            torch.full((batch_size, K, 1), 0.0, device=device, dtype=dtype),    # sin(yaw)
-            torch.full((batch_size, K, 1), 1.0, device=device, dtype=dtype),    # cos(yaw)
-            torch.full((batch_size, K, 1), 0.0, device=device, dtype=dtype),    # vx
-            torch.full((batch_size, K, 1), 0.0, device=device, dtype=dtype),    # vy
-        ], dim=-1)  # [B, K, 10]
+            theta_d,
+            z,
+            torch.zeros((B, K, 1), device=device, dtype=dtype),
+            torch.zeros((B, K, 1), device=device, dtype=dtype),
+            torch.full((B, K, 1), h_log, device=device, dtype=dtype),
+            torch.full((B, K, 1), 0.0, device=device, dtype=dtype),
+            torch.full((B, K, 1), 1.0, device=device, dtype=dtype),
+            torch.full((B, K, 1), 0.0, device=device, dtype=dtype),
+            torch.full((B, K, 1), 0.0, device=device, dtype=dtype),
+        ], dim=-1)
         
         return anchors, alpha_topk
-    
-    def encode_alpha(self, alpha_values):
-        """
-        将 α 编码为 embedding
-        
-        Args:
-            alpha_values: [B, K, 1] α 值
-        
-        Returns:
-            embedding: [B, K, d_alpha] α embedding
-        """
-        if not self.use_alpha or self.alpha_encoder is None or self._d_alpha == 0:
-            # 返回零向量，占位保持接口兼容
-            B, K, _ = alpha_values.shape
-            return alpha_values.new_zeros(B, K, self._d_alpha)
-        return self.alpha_encoder(alpha_values)
     
     def forward(self, radar_points, radar_mask):
         """
@@ -891,17 +811,6 @@ class RWHIModule(BaseModule):
             alpha_values = torch.cat([base_alpha, alpha_topk], dim=1)
         else:
             anchors, alpha_values = anchors_topk, alpha_topk
-        
-        # 【DDP 兼容性】alpha_encoder 虽然被创建，但 encode_alpha() 方法目前未被调用
-        # 为确保 DDP 下所有参数都参与计算图，添加 dummy sum
-        if self.training and self.alpha_encoder is not None:
-            dummy = None
-            for param in self.alpha_encoder.parameters():
-                term = param.sum() * 0.0
-                dummy = term if dummy is None else dummy + term
-            if dummy is not None:
-                # 将 dummy 加到 alpha_values 上，确保参与计算图
-                alpha_values = alpha_values + dummy
         
         return anchors, alpha_values
 

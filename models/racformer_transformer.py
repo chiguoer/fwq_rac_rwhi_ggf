@@ -371,6 +371,12 @@ class RaCFormerTransformerDecoderLayer(BaseModule):
             mgc_module=mgc_module,
             gaussian_params=gaussian_params,
         )
+        # eval 时可能 T=1，sampled_feat 为 [B,Q,G,T_actual*P,C]，点数可能小于 mixing.in_points，需 pad 到 in_points
+        need_points = self.mixing.in_points
+        got_points = sampled_feat.shape[3]
+        if got_points < need_points:
+            repeat_factor = (need_points + got_points - 1) // got_points
+            sampled_feat = sampled_feat.repeat(1, 1, 1, repeat_factor, 1)[:, :, :, :need_points, :]
 
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         

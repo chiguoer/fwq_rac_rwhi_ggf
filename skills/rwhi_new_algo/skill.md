@@ -4,6 +4,7 @@
 
 - **触发条件**：每次你“读取 / 看到”本文件内容时，立即进入 **skills 模式**。
 - **skills 模式的基础行为：**
+  0、接下来的回复请用中文。
   1. **优先完成**当前对话中用户给出的具体指令（当前 chat 的任务永远最高优先级）。
   2. 当操作者明确说出以下指令时：
 
@@ -182,6 +183,7 @@
 | **Extremely slow training with GGF/MGC enabled** | Replace `torch.linalg` operations on small fixed-size matrices (2x2) with closed-form analytical solutions to avoid CUDA kernel launch overhead. |
 | **VRAM explosion in Attention (GGA) modules** | Apply `torch.utils.checkpoint` to heavy bias calculation layers (GGA) during training to trade compute for memory. |
 | **DDP training startup hang or extreme slowness** | Disable `SyncBatchNorm` (`sync_bn=False`) unless strictly necessary; set `find_unused_parameters=False` if manual dummy loss is handled. |
+| **DDP RuntimeError: "parameters were not used in producing loss"** | Set `find_unused_parameters=True` in config; only set to False if you are 100% sure all params are used or manually handled. |
 | **System RAM OOM / Server Freeze** | Reduce `workers_per_gpu` (4->2) to lower memory pressure from multi-sweep high-res data loading. |
 | **Slow training (Kernel Overhead)** | Use scalar expansion for 2x2 Mahalanobis distance and analytical 2x2 Cholesky to avoid tiny-matmul overhead. |
 | **VRAM OOM in Attention** | Use chunked geometry-bias computation to avoid materializing `[B, H, Q, M]` tensors. |

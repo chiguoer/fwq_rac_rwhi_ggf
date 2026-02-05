@@ -574,6 +574,9 @@ class MGCModule(nn.Module):
         profile_mgc_every=100,  # profiler 输出间隔
         # 学习参数
         learnable_strength=True,
+        # 来自 config 的时间帧数 & 分组数，与 decoder 一致
+        num_frames=1,
+        num_groups=1,
         init_cfg=None,
     ):
         super().__init__()
@@ -605,6 +608,8 @@ class MGCModule(nn.Module):
         self.debug_mgc_max_print = debug_mgc_max_print
         self.profile_mgc = profile_mgc
         self.profile_mgc_every = profile_mgc_every
+        self.num_frames = int(num_frames)
+        self.num_groups = int(num_groups)
         self._mgc_debug_step = 0
         self._mgc_debug_prints = 0
         self.logger = logging.getLogger()
@@ -623,7 +628,15 @@ class MGCModule(nn.Module):
         self.strength_predictor = nn.Linear(embed_dims, 1)
         nn.init.zeros_(self.strength_predictor.weight)
         nn.init.constant_(self.strength_predictor.bias, constraint_strength)
-    
+
+    @property
+    def samples_per_ray(self) -> int:
+        """每条 query ray 在 MGC 中的采样槽位数（不含 frame/group 维）"""
+        if self.sample_res is None:
+            return 1
+        h, w = self.sample_res
+        return int(h) * int(w)
+
     def compute_ellipse_bounds(self, centers, sigmas, lidar2img=None, image_h=None, image_w=None):
         """
         计算雷达椭圆在图像平面的投影边界

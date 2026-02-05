@@ -193,7 +193,7 @@ def main():
     logging.info('Batch size per GPU: %d' % (cfgs.batch_size))
 
     if world_size > 1:
-        find_unused_parameters = cfgs.get('find_unused_parameters', False)
+        find_unused_parameters = cfgs.get('find_unused_parameters', True)
         broadcast_buffers = cfgs.get('broadcast_buffers', False)
         static_graph = cfgs.get('static_graph', False)  # 设置为 True 可解决 checkpoint + DDP 兼容性问题
         model = MMDistributedDataParallel(

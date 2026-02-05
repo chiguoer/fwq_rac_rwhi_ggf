@@ -21,7 +21,7 @@ except Exception as exc:
 from .racformer import RaCFormer
 from .racformer_head import RaCFormer_head
 from .racformer_transformer import RaCFormerTransformer
-from .rwhi import RWHIModule, AlphaMLP, AlphaEncoder, build_rwhi
+from .rwhi import RWHIModule, AlphaMLP,  build_rwhi
 from .ggf import (
     GGFModule, 
     GeometryFieldBuilder, 
@@ -34,7 +34,7 @@ from .ggf import (
 
 __all__ = [
     'RaCFormer', 'RaCFormer_head', 'RaCFormerTransformer',
-    'RWHIModule', 'AlphaMLP', 'AlphaEncoder', 'build_rwhi',
+    'RWHIModule', 'AlphaMLP',  'build_rwhi',
     # GGF2.0 模块
     'GGFModule', 'GeometryFieldBuilder', 'NativeRGF', 
     'MGCModule', 'GGAModule', 'build_ggf', 'GGFDebugger',

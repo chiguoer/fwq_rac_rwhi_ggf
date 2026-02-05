@@ -125,10 +125,13 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, lidar2img, image_h, im
     else:
         final = msmv_sampling_v2(mlvl_feats, sample_points_cam.contiguous(), scale_weights.contiguous())
     # reorganize the sampled features
-    C = final.shape[2]  # [BTG, Q, C, P]
-    final = final.reshape(B, T, G, Q, C, P)
+    # 使用 final 的实际 batch 维推断 T，以支持 eval 时 T=1 与 train 时 T=num_frames 不一致的情况
+    BTG, Q_out, C, P_out = final.shape  # [BTG, Q, C, P]
+    T_actual = BTG // (B * G)
+    assert BTG == B * T_actual * G, "final batch dim BTG=%d != B*T*G=%d*%d*%d" % (BTG, B, T_actual, G)
+    final = final.reshape(B, T_actual, G, Q_out, C, P_out)
     final = final.permute(0, 3, 2, 1, 5, 4)
-    final = final.flatten(3, 4)  # [B, Q, G, FP, C]
+    final = final.flatten(3, 4)  # [B, Q, G, T_actual*P, C]
     if not aggregate:
         return final, homo[:,0], i_view[:,0]
     return final

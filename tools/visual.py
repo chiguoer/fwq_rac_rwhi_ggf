@@ -454,9 +454,78 @@ def render_sample_data(
         plt.show()
     plt.close()
 
+
+def render_sample_gt_only(
+        sample_token: str,
+        box_vis_level: BoxVisibility = BoxVisibility.ANY,
+        out_path: str = None,
+        verbose: bool = True,
+    ) -> None:
+    """
+    仅根据 NuScenes 数据集标签，在所有相机视角上绘制 GT 3D 框。
+    不依赖模型预测结果，用于检查数据集标注是否正确。
+    """
+    sample = nusc.get('sample', sample_token)
+    cams = [
+        'CAM_FRONT_LEFT',
+        'CAM_FRONT',
+        'CAM_FRONT_RIGHT',
+        'CAM_BACK_LEFT',
+        'CAM_BACK',
+        'CAM_BACK_RIGHT',
+    ]
+
+    _, axes = plt.subplots(2, 3, figsize=(24, 12))
+    for i, cam in enumerate(cams):
+        sample_data_token = sample['data'][cam]
+        data_path, boxes_gt, camera_intrinsic = nusc.get_sample_data(
+            sample_data_token, box_vis_level=box_vis_level)
+
+        img = Image.open(data_path)
+        row, col = divmod(i, 3)
+        ax = axes[row, col]
+        ax.imshow(img)
+
+        for box in boxes_gt:
+            c = np.array(get_color(box.name)) / 255.0
+            box.render(ax, view=camera_intrinsic, normalize=True, colors=(c, c, c))
+
+        ax.set_xlim(0, img.size[0])
+        ax.set_ylim(img.size[1], 0)
+        ax.axis('off')
+        ax.set_aspect('equal')
+        ax.set_title(f'GT: {cam}')
+
+    if out_path is not None:
+        plt.savefig(out_path, bbox_inches='tight', pad_inches=0, dpi=200)
+    if verbose:
+        plt.show()
+    plt.close()
+
+
 if __name__ == '__main__':
     nusc = NuScenes(version='v1.0-trainval', dataroot='./data/nuscenes', verbose=True)
-    results = mmcv.load('submission/pts_bbox/r50_f8_results_nusc.json')
-    sample_token_list = list(results['results'].keys())
-    for id in range(0, 6019):
-        render_sample_data(sample_token_list[id], pred_data=results, out_path='./visual_outputs/'+str(sample_token_list[id]))
+    # 示例 1：预测 vs GT 可视化（原有逻辑）
+    # results = mmcv.load('submission/pts_bbox/r50_f8_results_nusc.json')
+    # sample_token_list = list(results['results'].keys())
+    # for idx in range(len(sample_token_list)):
+    #     render_sample_data(sample_token_list[idx], pred_data=results,
+    #                        out_path='./visual_outputs/' + str(sample_token_list[idx]))
+
+    # 示例 2：仅使用标签可视化 GT 目标框
+    # 对数据集所有的图片画GT框
+    # sample_tokens = [s['token'] for s in nusc.sample]
+    # for token in sample_tokens:
+    #     out_file = './visual_outputs_gt/' + token
+    #     render_sample_gt_only(token, out_path=out_file)
+
+
+    #选定特定的
+     # 方式 A：随便取第 0 个 sample
+    token = nusc.sample[1000]['token']
+
+    # 方式 B：如果你已有一个感兴趣的 sample_token
+    # token = 'a4f1c0e5f2a24e3e9b689ed0c1c0b8c3'
+
+    out_file = './visual_outputs_gt/' + token
+    render_sample_gt_only(token, out_path=out_file)

@@ -4,6 +4,7 @@
 # ---------------------------------------------
 
 import mmcv
+import os
 from nuscenes.nuscenes import NuScenes
 from PIL import Image
 from nuscenes.utils.geometry_utils import view_points, box_in_image, BoxVisibility, transform_matrix
@@ -494,7 +495,119 @@ def render_sample_gt_only(
         ax.set_ylim(img.size[1], 0)
         ax.axis('off')
         ax.set_aspect('equal')
-        ax.set_title(f'GT: {cam}')
+        ax.set_title(cam)
+
+    if out_path is not None:
+        plt.savefig(out_path, bbox_inches='tight', pad_inches=0, dpi=200)
+    if verbose:
+        plt.show()
+    plt.close()
+
+
+def find_sample_index_by_image_name(img_name: str):
+    """
+    根据图片文件名（不含路径）查找：
+      - 它对应的 sample 在 nusc.sample 中是第几个（index）
+      - 对应的 sample_token
+      - 对应的 sample_data 记录（camera）
+
+    Args:
+        img_name: 比如 'n008-2018-05-21-11-06-59-0400_CAM_FRONT__1526915283912465.jpg'
+
+    Returns:
+        (sample_index, sample_token, sample_data_record)
+        如果找不到，返回 (None, None, None)
+    """
+    # 统一只比较“文件名本身”，避免路径差异影响匹配
+    target_basename = os.path.basename(img_name).lower()
+
+    target_sd = None
+    for sd in nusc.sample_data:
+        if sd['sensor_modality'] != 'camera':
+            continue
+        basename = os.path.basename(sd['filename']).lower()
+        if basename == target_basename:
+            target_sd = sd
+            break
+
+    if target_sd is None:
+        return None, None, None
+
+    sample_token = target_sd['sample_token']
+
+    # 找到该 sample_token 在 nusc.sample 中的下标
+    sample_index = None
+    for i, s in enumerate(nusc.sample):
+        if s['token'] == sample_token:
+            sample_index = i
+            break
+
+    return sample_index, sample_token, target_sd
+
+
+def render_by_image_name(img_name: str,
+                         out_dir: str = './visual_outputs_gt/',
+                         box_vis_level: BoxVisibility = BoxVisibility.ANY,
+                         verbose: bool = True):
+    """
+    通过图片文件名，自动找到对应的 sample，并调用 render_sample_gt_only 进行可视化。
+
+    Args:
+        img_name: 比如 'n008-2018-05-21-11-06-59-0400_CAM_FRONT__1526915283912465.jpg'
+        out_dir: 输出图片的目录前缀
+    """
+    sample_index, sample_token, sd = find_sample_index_by_image_name(img_name)
+
+    if sample_token is None:
+        print(f'未在 nusc.sample_data 中找到图片: {img_name}')
+        return
+
+    print(f'图片 {img_name} 对应的 sample_index = {sample_index}, sample_token = {sample_token}')
+    out_path = out_dir + sample_token
+    render_sample_gt_only(sample_token,
+                          box_vis_level=box_vis_level,
+                          out_path=out_path,
+                          verbose=verbose)
+
+
+def render_single_image_by_name(img_name: str,
+                                box_vis_level: BoxVisibility = BoxVisibility.ANY,
+                                out_path: str = None,
+                                verbose: bool = True):
+    """
+    只根据“图片文件名”对这一张图片进行 GT 可视化，
+    不再画同一个 sample_token 下的其它 5 个相机视角。
+
+    Args:
+        img_name: 图片文件名（不含路径），例如
+                  'n008-2018-05-21-11-06-59-0400_CAM_FRONT__1526915283912465.jpg'
+        box_vis_level: BoxVisibility，可控制可见性要求，默认 ANY。
+        out_path: 若不为 None，则保存到该路径；否则只进行 plt.show()。
+    """
+    sample_index, sample_token, sd = find_sample_index_by_image_name(img_name)
+    if sd is None:
+        print(f'未在 nusc.sample_data 中找到图片: {img_name}')
+        return
+
+    # 这里直接用该 sample_data 的 token，获取图像与该视角下的 GT 框
+    sd_token = sd['token']
+    data_path, boxes_gt, camera_intrinsic = nusc.get_sample_data(
+        sd_token, box_vis_level=box_vis_level)
+
+    img = Image.open(data_path)
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+    ax.imshow(img)
+
+    for box in boxes_gt:
+        c = np.array(get_color(box.name)) / 255.0
+        box.render(ax, view=camera_intrinsic, normalize=True, colors=(c, c, c))
+
+    ax.set_xlim(0, img.size[0])
+    ax.set_ylim(img.size[1], 0)
+    ax.axis('off')
+    ax.set_aspect('equal')
+    # 标题直接用该图片对应的相机通道（如 CAM_FRONT）
+    ax.set_title(sd['channel'])
 
     if out_path is not None:
         plt.savefig(out_path, bbox_inches='tight', pad_inches=0, dpi=200)
@@ -504,7 +617,9 @@ def render_sample_gt_only(
 
 
 if __name__ == '__main__':
+    # 1. 初始化 NuScenes
     nusc = NuScenes(version='v1.0-trainval', dataroot='./data/nuscenes', verbose=True)
+
     # 示例 1：预测 vs GT 可视化（原有逻辑）
     # results = mmcv.load('submission/pts_bbox/r50_f8_results_nusc.json')
     # sample_token_list = list(results['results'].keys())
@@ -519,13 +634,44 @@ if __name__ == '__main__':
     #     out_file = './visual_outputs_gt/' + token
     #     render_sample_gt_only(token, out_path=out_file)
 
+    #示例3：选定特定的token
+    #  # 方式 A：随便取第 0 个 sample
+    # token = nusc.sample[1000]['token']
 
-    #选定特定的
-     # 方式 A：随便取第 0 个 sample
-    token = nusc.sample[1000]['token']
+    # # 方式 B：如果你已有一个感兴趣的 sample_token
+    # # token = 'a4f1c0e5f2a24e3e9b689ed0c1c0b8c3'
 
-    # 方式 B：如果你已有一个感兴趣的 sample_token
-    # token = 'a4f1c0e5f2a24e3e9b689ed0c1c0b8c3'
+    # out_file = './visual_outputs_gt/' + token
+    # render_sample_gt_only(token, out_path=out_file)
 
-    out_file = './visual_outputs_gt/' + token
-    render_sample_gt_only(token, out_path=out_file)
+    #示例4： 通过图片名称找到对应token 
+    # 2. 指定你感兴趣的图片文件名（不带路径）
+    img_name = 'n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915279512465.jpg'
+
+    # 3. 使用 find_sample_index_by_image_name 查询它是第几个 sample
+    idx, token, sd = find_sample_index_by_image_name(img_name)
+    if token is None:
+        print('未找到图片:', img_name)
+    else:
+        print('图片 {} 对应的 sample_index = {}, sample_token = {}'.format(img_name, idx, token))
+        print('该图片的相机通道为:', sd['channel'])
+
+        # 4. 使用 render_by_image_name 直接生成 6 个相机视角的 GT 可视化图
+        #    输出会保存在 ./visual_outputs_gt/<sample_token>.png（由 render_sample_gt_only 决定具体命名）
+        render_by_image_name(img_name,
+                             out_dir='./visual_outputs_gt/',
+                             box_vis_level=BoxVisibility.ANY,
+                             verbose=True)
+
+    #示例5：通过图片名字直接可视化这张图片
+    # img_name = 'n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915279512465.jpg'
+
+    # # 只画这一张图片
+    # render_single_image_by_name(
+    #     img_name,
+    #     box_vis_level=BoxVisibility.ANY,
+    #     out_path='./visual_outputs_gt/{}_single.png'.format(img_name)
+    # )
+
+
+# PYTHONPATH=. python tools/visual.py

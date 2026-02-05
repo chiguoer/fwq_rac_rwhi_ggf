@@ -178,7 +178,7 @@ def main():
     model = build_model(cfgs.model)
     model.init_weights()
 
-    sync_bn = False  # Force disable SyncBN to reduce DDP overhead during debugging
+    sync_bn = cfgs.get('sync_bn', True)
     if world_size > 1 and sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         print('Convert to SyncBatchNorm')
@@ -193,7 +193,7 @@ def main():
     logging.info('Batch size per GPU: %d' % (cfgs.batch_size))
 
     if world_size > 1:
-        find_unused_parameters = cfgs.get('find_unused_parameters', True)
+        find_unused_parameters = cfgs.get('find_unused_parameters', False)
         broadcast_buffers = cfgs.get('broadcast_buffers', False)
         static_graph = cfgs.get('static_graph', False)  # 设置为 True 可解决 checkpoint + DDP 兼容性问题
         model = MMDistributedDataParallel(

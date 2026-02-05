@@ -222,6 +222,7 @@ model = dict(
         rwhi_gate_init=rwhi_gate_init,    # 可学习门控初值
         rwhi_gate_const=rwhi_gate_const,  # 固定门控（备用）
         rwhi_affect_query=rwhi_affect_query,  # 从 config 控制是否启用
+        loss_alpha_anchor_weight=0.2,     # α辅助监督，稳定锚点置信度学习
         rwhi_cfg=rwhi_cfg,                # RWHI 配置
         polar_radius=R_MAX,               # 全链路统一 polar_radius
         # ============ RWHI v7 配置结束 ============
@@ -362,7 +363,7 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=1e-4,
+    lr=4e-4,
     paramwise_cfg=dict(custom_keys={
         'img_backbone': dict(lr_mult=0.1),
         'sampling_offset': dict(lr_mult=0.1),
@@ -387,8 +388,8 @@ lr_config = dict(
     min_lr_ratio=1e-3
 )
 
-total_epochs = 20
-batch_size = 4
+total_epochs = 36
+batch_size = 2
 
 # load pretrained weights
 load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
@@ -419,6 +420,9 @@ eval_config = dict(interval=2)
 
 # other flags
 debug = False
+sync_bn = True
+find_unused_parameters = False
+broadcast_buffers = False
 
 # DDP 配置
 # 注意：static_graph 不适用于此模型，因为计算图可能根据雷达数据变化

@@ -198,7 +198,7 @@ ggf_cfg = dict(
         soft_clamp_beta=1.0,
         chunk_size=256,             # 按 M 维分块，避免巨大 bias 张量
         return_geometry_bias=False, # 不返回完整 bias，避免显存暴涨
-        debug_gga=True,
+        debug_gga=False,
         debug_gga_every=1000,
     ),
 )
@@ -234,7 +234,7 @@ img_backbone = dict(
     norm_cfg=dict(type='BN2d', requires_grad=True),
     norm_eval=True,
     style='pytorch',
-    with_cp=False)
+    with_cp=True)
 
 img_neck = dict(
     type='FPN',
@@ -317,6 +317,7 @@ model = dict(
         rwhi_gate_init=rwhi_gate_init,    # 可学习门控初值
         rwhi_gate_const=rwhi_gate_const,  # 固定门控（备用）
         rwhi_affect_query=rwhi_affect_query,  # 从 config 控制是否启用
+        loss_alpha_anchor_weight=0.2,     # 仅在 use_alpha=True 时生效
         rwhi_cfg=rwhi_cfg,                # RWHI 配置
         polar_radius=R_MAX,               # 全链路统一 polar_radius
         # ============ RWHI v7 配置结束 ============
@@ -487,7 +488,7 @@ lr_config = dict(
     min_lr_ratio=1e-3
 )
 
-total_epochs = 20
+total_epochs = 36
 batch_size = 2
 
 # load pretrained weights
@@ -519,7 +520,9 @@ eval_config = dict(interval=2)
 
 # other flags
 debug = False
-find_unused_parameters = True
+sync_bn = True
+find_unused_parameters = False
+broadcast_buffers = False
 
 # DDP 配置
 # 注意：static_graph 不适用于此模型，因为计算图可能根据雷达数据变化

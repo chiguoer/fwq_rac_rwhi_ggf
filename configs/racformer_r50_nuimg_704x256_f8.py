@@ -303,8 +303,8 @@ lr_config = dict(
     min_lr_ratio=1e-3
 )
 
-total_epochs = 20
-batch_size = 4
+total_epochs = 36
+batch_size = 2
 
 # load pretrained weights
 load_from = 'pretrain/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth'
@@ -335,7 +335,7 @@ eval_config = dict(interval=2)
 # other flags
 debug = False
 sync_bn = True
-find_unused_parameters = True
+find_unused_parameters = False
 broadcast_buffers = False
 
 custom_hooks = [

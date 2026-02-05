@@ -36,6 +36,7 @@ class RaCFormer_head(DETRHead):
                  rwhi_gate_init=0.2,
                  rwhi_gate_const=0.7,
                  rwhi_affect_query=True,
+                 loss_alpha_anchor_weight=0.0,
                  rwhi_cfg=None,
                  polar_radius=None,
                  # ============ GGF2.0 配置 ============
@@ -59,6 +60,7 @@ class RaCFormer_head(DETRHead):
         self.rwhi_affect_query = rwhi_affect_query
         self.rwhi_gate_init = rwhi_gate_init
         self._rwhi_gate_const_value = rwhi_gate_const
+        self.loss_alpha_anchor_weight = float(loss_alpha_anchor_weight)
         self.rwhi_cfg = rwhi_cfg if rwhi_cfg is not None else {}
         self.rwhi_cfg.setdefault('use_alpha', self.use_alpha)
         
@@ -726,6 +728,56 @@ class RaCFormer_head(DETRHead):
         
         return loss_cls, loss_bbox
 
+    def _loss_alpha_anchor(self,
+                           cls_scores,
+                           bbox_preds,
+                           alpha_values,
+                           gt_bboxes_list,
+                           gt_labels_list,
+                           gt_bboxes_ignore=None):
+        """基于最后一层匹配结果监督 alpha，稳定 RWHI 点置信度学习。"""
+        num_imgs = cls_scores.size(0)
+        alpha_values = alpha_values.squeeze(-1)
+
+        loss_sum = alpha_values.new_tensor(0.0)
+        num_total = 0
+
+        for i in range(num_imgs):
+            _, _, _, _, pos_inds, neg_inds = self._get_target_single(
+                cls_scores[i],
+                bbox_preds[i],
+                gt_labels_list[i],
+                gt_bboxes_list[i],
+                gt_bboxes_ignore,
+            )
+            num_pos = pos_inds.numel()
+            num_neg = neg_inds.numel()
+            if num_pos + num_neg == 0:
+                continue
+
+            alpha_img = alpha_values[i]
+            alpha_pos = alpha_img[pos_inds] if num_pos > 0 else alpha_img.new_empty(0)
+            alpha_neg = alpha_img[neg_inds] if num_neg > 0 else alpha_img.new_empty(0)
+            label_pos = alpha_pos.new_ones(alpha_pos.shape)
+            label_neg = alpha_neg.new_zeros(alpha_neg.shape)
+
+            if num_pos > 0 and num_neg > 0:
+                alpha_sel = torch.cat([alpha_pos, alpha_neg], dim=0)
+                label_sel = torch.cat([label_pos, label_neg], dim=0)
+            else:
+                alpha_sel = alpha_pos if num_pos > 0 else alpha_neg
+                label_sel = label_pos if num_pos > 0 else label_neg
+
+            loss_sum = loss_sum + F.binary_cross_entropy(alpha_sel, label_sel, reduction='sum')
+            num_total += num_pos + num_neg
+
+        if num_total == 0:
+            return loss_sum
+
+        avg_factor = reduce_mean(alpha_values.new_tensor([num_total]))
+        avg_factor = torch.clamp(avg_factor, min=1.0)
+        return loss_sum / avg_factor
+
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self,
              gt_bboxes_list,
@@ -782,6 +834,19 @@ class RaCFormer_head(DETRHead):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             num_dec_layer += 1
+
+        if self.training and self.use_alpha and self.loss_alpha_anchor_weight > 0:
+            alpha_values = preds_dicts.get('alpha_values', None)
+            if alpha_values is not None:
+                loss_alpha_anchor = self._loss_alpha_anchor(
+                    all_cls_scores[-1],
+                    all_bbox_preds[-1],
+                    alpha_values,
+                    gt_bboxes_list,
+                    gt_labels_list,
+                    gt_bboxes_ignore,
+                )
+                loss_dict['loss_alpha_anchor'] = loss_alpha_anchor * self.loss_alpha_anchor_weight
 
         return loss_dict
 

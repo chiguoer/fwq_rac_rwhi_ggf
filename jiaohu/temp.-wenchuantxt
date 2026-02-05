@@ -10,19 +10,37 @@ python visual/visual.py
 TORCH_DISTRIBUTED_DEBUG=DETAIL torchrun --nproc_per_node 2 train.py --config configs/racformer_r50_nuimg_704x256_f8.py
 
 
-(racrwhi) duanxiong@wang:/media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27$ python visual/visual.py
-Traceback (most recent call last):
-  File "visual/visual.py", line 28, in <module>
-    from render import visualize_sample, visualize_sample_radar
-ModuleNotFoundError: No module named 'render'
-
-(racrwhi) duanxiong@wang:/media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27$ python tools/visual.py
-Traceback (most recent call last):
-  File "tools/visual.py", line 28, in <module>
-    from render import visualize_sample, visualize_sample_radar
-  File "/media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27/tools/render.py", line 22, in <module>
-    from loaders.nuscenes_dataset import RadarPointCloud_v2
-ModuleNotFoundError: No module named 'loaders'
-
 cd /media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27
+
 PYTHONPATH=. python tools/visual.py
+
+
+本代码Baseline还没跑过，但是伪Baseline跑过两轮（racformer的源代码源代码跑过20epoch）
+---相比于源代码的Baseline的第二轮map0.32，伪Baseline的第二轮map只有0.23，现在将源代码的
+地址给你：
+请你分析现在的代码是否有漂移，若发现问题请你直接更改，注意我们的目的是为了使得程序跑的指标更高，
+您可在能让程序正确运行的基础上更改算法
+
+（非常感谢您写的自动化ablation的脚本，给你提醒一点：
+跑torchrun --nproc_per_node 2 train.py --config configs/racformer_with_rwhi_ggf.py时，
+batch_size最好设置成2，因为这时候显存占用就有22~24G了，再翻倍就是44~48G，这超出了我们的显存46G）
+  # 1) Baseline（原RaCFormer）
+  torchrun --master_port 29601 --nproc_per_node 2 train.py \
+    --config configs/racformer_r50_nuimg_704x256_f8.py
+
+  # 2) 伪Baseline（走新代码路径，但RWHI/GGF全关）
+  torchrun --master_port 29602 --nproc_per_node 2 train.py \
+    --config configs/racformer_with_rwhi_ggf.py \
+    --override \
+    model.pts_bbox_head.use_rwhi=False \
+    model.pts_bbox_head.rwhi_cfg.enabled=False \
+    model.pts_bbox_head.ggf_cfg.enabled=False \
+    model.pts_bbox_head.transformer.ggf_cfg.enabled=False
+
+
+请你简单调整自动化ablation的脚本：
+1）先跑baseline的两个epoch，batch_size=4，
+2）再跑伪baseline的epoch=20，batch_size=2
+3）再跑之后的epoch=20，batch_size=2
+
+将git status当中的修改git add/commit -m 等并git push上传github

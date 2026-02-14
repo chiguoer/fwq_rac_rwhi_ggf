@@ -1,0 +1,133 @@
+双卡训练出问题的修复
+torchrun --nproc_per_node 2 train.py --config configs/racformer_with_rwhi_ggf.py
+\
+mkdir visual_outputs_gt 
+
+python visual/visual.py
+
+rwhi used:
+图片 n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915279512465.jpg 对应的 sample_index = 4879, sample_token = e656893de8e14a3c913bb3493d2afefe
+
+MGC used：
+n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915382012465.jpg
+图片 n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915382012465.jpg 对应的 sample_index = 5019, sample_tokef39a0c1ceb64bb0b356113aa7e3cbfa
+
+n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915425362465.jpg
+图片 n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915425362465.jpg 对应的 sample_index = 5069, sample_toke44cda02c39c43ff8bbf0cc5a2b92849
+
+n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915649912465.jpg
+图片 n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915649912465.jpg 对应的 sample_index = 5190, sample_tokebb30ca10e6b4c83b788b0a8d99f33bb
+
+
+
+ torchrun --nproc_per_node 2 train.py --config configs/racformer_r50_nuimg_704x256_f8.py
+TORCH_DISTRIBUTED_DEBUG=DETAIL torchrun --nproc_per_node 2 train.py --config configs/racformer_r50_nuimg_704x256_f8.py
+
+
+cd /media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27
+
+PYTHONPATH=. python tools/visual.py
+
+
+本代码Baseline还没跑过，但是伪Baseline跑过两轮（racformer的源代码源代码跑过20epoch）
+---相比于源代码的Baseline的第二轮map0.32，伪Baseline的第二轮map只有0.23，现在将源代码的
+地址给你：
+请你分析现在的代码是否有漂移，若发现问题请你直接更改，注意我们的目的是为了使得程序跑的指标更高，
+您可在能让程序正确运行的基础上更改算法
+
+
+请你简单调整自动化ablation的脚本：
+1）先跑baseline的epoch=2，batch_size=4，
+2）再跑伪baseline的epoch=20，batch_size=2
+3）再跑之后的epoch=20，batch_size=2
+
+
+将git status当中的修改git add/commit -m 等并git push上传github
+
+
+
+你现在要基于现有的 `nusence_vis.py` 脚本做两个方向的改动：
+
+1）修正 Figure A / Figure B / Figure C 中 legend 里面 Ego 红色五角星变形的问题。  
+2）重构 Figure C 的 MGC 可视化逻辑：从当前的「单目标、全局视野」改成「3~4 辆近处车，每辆车一行：左 BEV 局部 + 右 zoom-in 图像，多椭圆」。
+
+下面是基于现有代码结构的具体修改要求。
+
+
+现在请你检查自动化ablation的脚本，是否满足下面的要求
+1）先跑baseline的epoch=9，batch_size=4，
+2）再跑伪baseline的epoch=5，batch_size=2
+3）再跑之后的epoch=20，batch_size=2
+
+
+现在的你是否成功导入了superpowerskills
+
+请你将本个chat的工作简要总结，生成上下文交接文字，我将/new来完成后面的任务
+
+前面的路径是原本racformer的代码和训练的日志文件，
+本次配置的消融实验已经看得到部分结果了，其中原本的baseline和伪baseline的结果
+都远低于原本racformer的代码跑出来的结果：原本racformer的第二轮map：0.32 现在代码的baseline的第二轮map：0.27 
+伪baseline的map：0.23（并且上升趋势很小）
+之前你检查过了现在代码和原本racformer的代码的前向逻辑基本一致，但是效果却是差距如此之大，我认为可能是后面解码的问题
+请你分析我提出的可能
+你也可以对比源代码和现在的rac-rwhi-ggf代码，分析其他可能原因
+若发现相关原因，请先列出计划，再去更改
+记得使用superpower的系统审阅和问题分析skills
+
+请你直接讲出当前的代码是否有问题，到底是如何问题
+
+但是还未讲明原本的baseline和伪baseline的结果为何会有不同
+
+1、但是伪baseline当中的两个开关都关了之后，其训练逻辑不应该和baseline一致吗？效果为何会不同
+2、不用去追究如何如何又怎么不同，现在就想将现在的代码的性能提高，请问你有什么建议
+
+直接把 run_rwhi_ggf_ablation_scan.sh 改成“公平对比口径”，并给一套一键复现实验命令。
+直接先训练ggf、rwhi开关=True的训练(racformer_with_rwhi_ggfs)，再来单独rwhi=True（用~racformer_with_rwhi.py)，再来baseline的训练
+
+现在的baseline和加入了创新模块ggf和rwhi的代码是否有可能在后续的训练当中map效果有9-1的那份代码（源码）那么好
+
+改公共链路/环境就“自然达到 2025-09-01 那份源码水平”概率不高。
+那么：请问你该如何去更改公共链路/环境，难道需要等到这个代码跑完之后吗
+
+我已经停止了训练，代码更改请直接在原本的代码上面更改
+消融实验的程序适当提高epoch的次数（比如变成24）
+
+
+GIT-PUSH(1)                       Git Manual                       GIT-PUSH(1)
+
+NAME
+       git-push - Update remote refs along with associated objects
+
+SYNOPSIS
+       git push [--all | --mirror | --tags] [--follow-tags] [--atomic] [-n | --dry-run] [--receive-pack=<git-receive-pack>]
+                  [--repo=<repository>] [-f | --force] [-d | --delete] [--prune] [-v | --verbose]
+                  [-u | --set-upstream] [-o <string> | --push-option=<string>]
+                  [--[no-]signed|--signed=(true|false|if-asked)]
+                  [--force-with-lease[=<refname>[:<expect>]]]
+                  [--no-verify] [<repository> [<refspec>...]]
+
+DESCRIPTION
+       Updates remote refs using local refs, while sending objects necessary
+       to complete the given refs.
+
+       You can make interesting things happen to a repository every time you
+       push into it, by setting up hooks there. See documentation for git-
+       receive-pack(1).
+(base) duanxiong@wang:/media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27$ git checkout ggf_add
+Updating files: 100% (21/21), done.
+Switched to branch 'ggf_add'
+Your branch and 'origin/ggf_add' have diverged,
+and have 2 and 1 different commits each, respectively.
+  (use "git pull" to merge the remote branch into yours)
+(base) duanxiong@wang:/media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27$ git branch -v
+* ggf_add        595cd7f [ahead 2, behind 1] codex gonggong lianlu gaijing
+  ggf_add_repack 76361f4 deleted submission
+  master         c9c37fc add ggf
+(base) duanxiong@wang:/media/T1/zc/rac-rwhi-ggf/rwhi_ggf_1-27$ git push -u origin ggf_add
+To github.com:chiguoer/fwq_rac_rwhi_ggf.git
+ ! [rejected]        ggf_add -> ggf_add (non-fast-forward)
+error: failed to push some refs to 'git@github.com:chiguoer/fwq_rac_rwhi_ggf.git'
+hint: Updates were rejected because the tip of your current branch is behind
+hint: its remote counterpart. Integrate the remote changes (e.g.
+hint: 'git pull ...') before pushing again.
+hint: See the 'Note about fast-forwards' in 'git push --help' for details.
